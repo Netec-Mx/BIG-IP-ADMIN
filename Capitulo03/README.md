@@ -4,1998 +4,994 @@
 
 | Campo | Valor |
 |---|---|
-| **Duración** | 60 minutos |
-| **Complejidad** | Media |
-| **Nivel Bloom** | Aplicar (Apply) |
+| Duración | 60 minutos |
+| Complejidad | Media-alta |
+| Nivel de Bloom | Aplicar y analizar |
+| Modalidad | Práctica individual en pod Azure |
 
-## Descripción General
+## Descripción general
 
-En este laboratorio crearás y validarás todos los objetos LTM necesarios para publicar una aplicación web a través de F5 BIG-IP: Nodes, Pool Members, un Pool con método Round Robin, un Health Monitor HTTP personalizado y un Virtual Server de tipo Standard. Partiendo de un BIG-IP con conectividad de red pre-configurada pero sin objetos LTM, construirás la cadena completa de entrega de aplicación y verificarás el funcionamiento extremo a extremo, incluyendo la detección automática de fallos en backends y la recuperación del servicio.
+En este laboratorio administrarás un segundo servicio web mediante BIG-IP LTM sin interrumpir el Virtual Server del Laboratorio 3. Construirás un pool independiente que utiliza los dos servidores existentes, compararás dos métodos de distribución de conexiones y provocarás una falla de verificación HTTP controlada para comprobar una diferencia fundamental: **un puerto TCP abierto no garantiza que la aplicación responda correctamente**. Finalmente, retirarás temporalmente un servidor del servicio, interpretarás su estado y recuperarás la capacidad original.
 
-## Objetivos de Aprendizaje
+El laboratorio no requiere Azure Portal, nuevas máquinas virtuales, nuevas IP ni modificar las VLANs o Self IPs. El servicio del Laboratorio 3 debe permanecer intacto.
 
-Al completar este laboratorio serás capaz de:
+## Objetivos de aprendizaje
 
-- [ ] Crear Nodes y Pool Members en BIG-IP, comprendiendo la relación jerárquica Node → Pool Member → Pool y el papel del service port.
-- [ ] Configurar un Health Monitor HTTP personalizado y asociarlo a un Pool para determinar automáticamente la disponibilidad de cada backend.
-- [ ] Crear un Virtual Server de tipo Standard con perfiles TCP y HTTP que publique una aplicación web accesible desde la red externa mediante un Pool con balanceo Round Robin.
-- [ ] Validar la distribución de tráfico entre backends y verificar que BIG-IP detecta la caída de un Pool Member, redirige el tráfico al miembro sano y restaura automáticamente el miembro cuando el servicio se recupera.
+Al finalizar, podrás:
 
-## Prerrequisitos
+- [ ] Publicar una segunda aplicación lógica utilizando una VIP:puerto distinta y los mismos servidores físicos.
+- [ ] Configurar un pool y un monitor HTTP que valide el código de respuesta, no solamente conectividad TCP.
+- [ ] Comparar Round Robin con Ratio (Member), modificando pesos y evaluando estadísticas reales.
+- [ ] Diagnosticar una condición en la que TCP responde, pero una ruta HTTP de aplicación falla.
+- [ ] Diferenciar un miembro **Offline por monitor** de un miembro **retirado administrativamente**.
+- [ ] Recuperar el servicio y comprobar que la publicación inicial permanece operativa.
 
-### Conocimientos requeridos
+## Prerrequisitos y acceso
 
-| Área | Detalle |
-|---|---|
-| TCP/IP | Direccionamiento IP, subredes, máscaras, gateways, puertos TCP |
-| HTTP | Modelo cliente-servidor, funcionamiento básico del puerto 80 |
-| Linux | Comandos básicos de terminal: `systemctl`, `curl`, `ssh` |
-| BIG-IP | Navegación básica en TMUI (GUI web) y concepto de TMSH |
-| VLANs | Comprensión de segmentación de red |
+- Laboratorios 1 a 3 completados; BIG-IP VE con interfaces, VLANs y Self IPs operativas.
+- Dos servidores web funcionando en `10.1.2.4:80` y `10.1.2.5:80`.
+- Cliente Ubuntu con Firefox y `curl`.
+- Cuenta administrativa de BIG-IP. Las sesiones SSH del pod pueden entrar directamente en **TMSH**: ejecuta los comandos sin anteponer `tmsh`.
+- **No se necesita acceso SSH a los servidores web** ni privilegios en Azure Portal.
 
-### Acceso y entorno requeridos
-
-| Recurso | Requisito |
-|---|---|
-| BIG-IP VE | Acceso TMUI vía `https://192.0.2.245` desde la estación de administración. Credenciales: `admin` / contraseña proporcionada por el instructor. |
-| Cliente de pruebas | Máquina con IP `10.10.10.10/24` en la VLAN external, con `curl` (8.5.0) y Firefox ESR (128.0 ESR) disponibles. |
-| Servidores backend | `web01` (`10.20.20.11`) y `web02` (`10.20.20.12`) con Apache 2.4.58 activo en TCP/80 y páginas `index.html` personalizadas (cada una identifica el servidor). |
-| Acceso SSH | Credenciales SSH a `web01` y `web02` para detener/iniciar Apache durante las pruebas de failover. |
-| Conectividad de red | VLANs `external` (interfaz 1.1, red `10.10.10.0/24`) e `internal` (interfaz 1.2, red `10.20.20.0/24`) configuradas en BIG-IP con Self IPs `10.10.10.245` y `10.20.20.245` respectivamente. |
-
-> **Importante:** Este laboratorio asume que las VLANs, Self IPs y rutas del BIG-IP fueron pre-configuradas por el instructor. No se requiere ningún laboratorio anterior completado por el estudiante.
-
-## Entorno de Laboratorio
-
-### Topología de red
-
-```
-┌──────────────┐       VLAN external        ┌──────────────────┐       VLAN internal        ┌──────────────┐
-│   Cliente     │      10.10.10.0/24         │    BIG-IP VE     │      10.20.20.0/24         │   web01       │
-│ 10.10.10.10   ├───────────────────────────►│ ext: 10.10.10.245│───────────────────────────►│ 10.20.20.11   │
-│               │                            │ int: 10.20.20.245│                            │ Apache :80    │
-└──────────────┘                             │ mgmt:192.0.2.245 │                            └──────────────┘
-                                             │ VIP: 10.10.10.100│       VLAN internal        ┌──────────────┐
-┌──────────────┐       Management            │                  │───────────────────────────►│   web02       │
-│ Admin Client  │      192.0.2.0/24          │                  │                            │ 10.20.20.12   │
-│ 192.0.2.10    ├───────────────────────────►│                  │                            │ Apache :80    │
-└──────────────┘                             └──────────────────┘                            └──────────────┘
-```
-
-### Software del entorno
-
-| Componente | Versión exacta | Fuente oficial |
+| Equipo o componente | Dirección o identificador | Uso |
 |---|---|---|
-| F5 BIG-IP VE | 17.1.2 | https://my.f5.com/manage/s/downloads |
-| Ubuntu Server (backends) | 22.04.4 LTS | https://releases.ubuntu.com/22.04/ |
-| Apache HTTP Server | 2.4.58 | https://httpd.apache.org/download.cgi |
-| curl (cliente) | 8.5.0 | https://curl.se/download.html |
-| Mozilla Firefox ESR | 128.0 ESR | https://www.mozilla.org/en-US/firefox/enterprise/ |
+| BIG-IP Management | `10.1.1.200` | TMUI y TMSH desde Ubuntu; acceso público desde Windows según el pod |
+| BIG-IP External Self IP | `10.1.3.200` | Red de clientes y dirección de publicación |
+| BIG-IP Internal Self IP | `10.1.2.200` | Acceso a servidores y SNAT AutoMap |
+| Ubuntu cliente | `10.1.1.246` (eth0), `10.1.3.4` (eth1) | Pruebas HTTP |
+| web01 | `10.1.2.4:80` | Pool member |
+| web02 | `10.1.2.5:80` | Pool member |
+| Servicio previo (Lab 3) | `10.1.3.200:8080` | Servicio de referencia: no modificar |
+| **Servicio nuevo (Lab 4)** | **`10.1.3.200:8081`** | Objeto principal del laboratorio |
 
-### Verificación previa del entorno
+## Diagrama de topología
 
-Antes de comenzar, ejecuta las siguientes comprobaciones desde el **cliente de pruebas** (`10.10.10.10`):
-
-**1. Conectividad al Self IP externo del BIG-IP:**
-
-```bash
-ping -c 3 10.10.10.245
+```mermaid
+flowchart LR
+    PC["PC Windows<br/>TMUI / PuTTY / RDP"]
+    UB["Ubuntu cliente<br/>eth0 10.1.1.246<br/>eth1 10.1.3.4"]
+    BIG["BIG-IP VE<br/>Mgmt 10.1.1.200<br/>External 10.1.3.200<br/>Internal 10.1.2.200"]
+    V3["VS existente Lab 3<br/>10.1.3.200:8080"]
+    V4["VS nuevo Lab 4<br/>10.1.3.200:8081"]
+    P4["pool_lab04<br/>Round Robin / Ratio"]
+    W1["web01<br/>10.1.2.4:80"]
+    W2["web02<br/>10.1.2.5:80"]
+    PC -. "RDP" .-> UB
+    PC -. "Administración vía Azure" .-> BIG
+    UB -->|"HTTP 8080"| V3
+    UB -->|"HTTP 8081"| V4
+    V3 -. "Servicio existente (sin cambios)" .-> BIG
+    V4 --> P4
+    P4 --> W1
+    P4 --> W2
+    BIG -. "Management 10.1.1.0/24" .-> UB
+    BIG -. "External 10.1.3.0/24" .-> UB
+    BIG -. "Internal 10.1.2.0/24" .-> W1
+    BIG -. "Internal 10.1.2.0/24" .-> W2
 ```
 
-Resultado esperado: 3 respuestas exitosas, 0% de pérdida de paquetes.
-
-**2. Conectividad directa a los backends desde BIG-IP (ejecutar vía SSH al BIG-IP o desde TMSH):**
-
-Accede por SSH al BIG-IP desde la estación de administración:
-
-```bash
-ssh admin@192.0.2.245
-```
-
-Desde el shell del BIG-IP:
-
-```bash
-ping -c 3 10.20.20.11
-ping -c 3 10.20.20.12
-```
-
-Resultado esperado: ambos servidores responden.
-
-**3. Servicio Apache activo en los backends (desde BIG-IP):**
-
-```bash
-curl -s -o /dev/null -w "%{http_code}" http://10.20.20.11/
-curl -s -o /dev/null -w "%{http_code}" http://10.20.20.12/
-```
-
-Resultado esperado: ambos devuelven `200`.
-
-**4. Verificar que no existen objetos LTM previos (desde TMSH en el BIG-IP):**
-
-```bash
-tmsh list ltm node
-tmsh list ltm pool
-tmsh list ltm virtual
-```
-
-Resultado esperado: los tres comandos no devuelven objetos o devuelven salida vacía. Si existen objetos previos, notifica al instructor antes de continuar.
-
-## Instrucciones Paso a Paso
-
-### Paso 1: Crear los Nodes para los servidores backend
-
-**Objetivo:** Registrar cada servidor backend como un Node en BIG-IP, estableciendo la relación fundamental entre una dirección IP y un nombre descriptivo reutilizable.
-
-**Instrucciones:**
-
-1. Abre el navegador Firefox en la estación de administración y accede a `https://192.0.2.245`.
-2. Inicia sesión con las credenciales `admin` y la contraseña del laboratorio.
-3. Navega a **Local Traffic → Nodes → Node List**.
-4. Haz clic en **Create** (esquina superior derecha).
-5. Configura el primer Node con los siguientes valores:
-
-   | Campo | Valor |
-   |---|---|
-   | Name | `web01` |
-   | Address | `10.20.20.11` |
-   | Health Monitors | `default` (dejar sin cambios por ahora) |
-
-6. Haz clic en **Finished**.
-7. Repite los pasos 4–6 para el segundo Node:
-
-   | Campo | Valor |
-   |---|---|
-   | Name | `web02` |
-   | Address | `10.20.20.12` |
-   | Health Monitors | `default` (dejar sin cambios por ahora) |
-
-8. Haz clic en **Finished**.
-
-**Resultado esperado:**
-
-La lista de Nodes muestra dos entradas: `web01` (10.20.20.11) y `web02` (10.20.20.12). El estado de cada Node aparece como un círculo azul (Unknown) o verde (Available) dependiendo de si existe un monitor por defecto asociado al Node.
-
-**Verificación:**
-
-Desde TMSH en el BIG-IP, confirma la creación:
-
-```bash
-tmsh list ltm node web01
-tmsh list ltm node web02
-```
-
-Salida esperada para cada Node (ejemplo para `web01`):
-
-```
-ltm node web01 {
-    address 10.20.20.11
-}
-```
-
-Verifica el estado operativo:
-
-```bash
-tmsh show ltm node web01
-tmsh show ltm node web02
-```
-
-Confirma que el campo `Addr` muestra la IP correcta para cada Node. El estado `Availability` puede mostrar `unknown` si no hay monitor asignado directamente al Node; esto es correcto en este punto.
-
-### Paso 2: Crear el Health Monitor HTTP personalizado
-
-**Objetivo:** Definir un monitor de salud HTTP que valide no solo la conectividad TCP sino la respuesta HTTP real de la aplicación, asegurando que BIG-IP detecte fallos a nivel de aplicación.
-
-**Instrucciones:**
-
-1. En TMUI, navega a **Local Traffic → Monitors**.
-2. Haz clic en **Create**.
-3. Configura el monitor con los siguientes valores:
-
-   | Campo | Valor |
-   |---|---|
-   | Name | `monitor_http_app` |
-   | Type | `HTTP` |
-   | Interval | `5` |
-   | Timeout | `16` |
-   | Send String | `GET / HTTP/1.1\r\nHost: app.lab.local\r\nConnection: close\r\n\r\n` |
-   | Receive String | (dejar vacío — cualquier respuesta HTTP válida se acepta) |
-
-   > **Nota técnica:** El campo `Send String` envía una petición HTTP/1.1 completa con cabecera `Host` y `Connection: close`. El formato `\r\n` representa los retornos de carro y saltos de línea requeridos por el protocolo HTTP. La secuencia final `\r\n\r\n` marca el fin de las cabeceras HTTP.
-
-   > **Nota sobre Interval y Timeout:** El Interval de 5 segundos indica que BIG-IP envía una comprobación cada 5 segundos. El Timeout de 16 segundos permite que fallen hasta 3 comprobaciones consecutivas (3 × 5 = 15 < 16) antes de marcar el miembro como Offline. Esta relación `Timeout > (3 × Interval)` es una práctica recomendada para evitar falsos positivos.
-
-4. Deja el resto de campos en sus valores predeterminados.
-5. Haz clic en **Finished**.
-
-**Resultado esperado:**
-
-El monitor `monitor_http_app` aparece en la lista de monitores bajo **Local Traffic → Monitors**, con tipo HTTP.
-
-**Verificación:**
-
-Desde TMSH:
-
-```bash
-tmsh list ltm monitor http monitor_http_app
-```
-
-Salida esperada (campos relevantes):
-
-```
-ltm monitor http monitor_http_app {
-    adaptive disabled
-    defaults-from http
-    interval 5
-    recv none
-    send "GET / HTTP/1.1\r\nHost: app.lab.local\r\nConnection: close\r\n\r\n"
-    time-until-up 0
-    timeout 16
-}
-```
-
-Confirma que `interval`, `timeout` y `send` coinciden con los valores configurados.
-
-### Paso 3: Crear el Pool con Pool Members y asociar el Health Monitor
-
-**Objetivo:** Agrupar ambos servidores backend como Pool Members dentro de un Pool, asignar el método de balanceo Round Robin y asociar el Health Monitor HTTP para validación automática de disponibilidad.
-
-**Instrucciones:**
-
-1. En TMUI, navega a **Local Traffic → Pools → Pool List**.
-2. Haz clic en **Create**.
-3. Configura el Pool con los siguientes valores:
-
-   | Campo | Valor |
-   |---|---|
-   | Name | `pool_http_app` |
-   | Health Monitors | Selecciona `monitor_http_app` y muévelo a la columna **Active** |
-   | Load Balancing Method | `Round Robin` |
-
-4. En la sección **New Members**, agrega los Pool Members:
-
-   - **Primer miembro:**
-     - Selecciona **Node List** en el campo de selección.
-     - Node: `web01`
-     - Service Port: `80` (o escribe `HTTP`)
-     - Haz clic en **Add**.
-
-   - **Segundo miembro:**
-     - Node: `web02`
-     - Service Port: `80`
-     - Haz clic en **Add**.
-
-5. Verifica que ambos miembros aparecen en la tabla de miembros con las direcciones `10.20.20.11:80` y `10.20.20.12:80`.
-6. Haz clic en **Finished**.
-
-**Resultado esperado:**
-
-El Pool `pool_http_app` aparece en la lista de Pools. Tras unos segundos (dependiendo del intervalo del monitor), el icono de estado del Pool debería cambiar a verde (Available), indicando que al menos un miembro está respondiendo correctamente al Health Monitor.
-
-**Verificación:**
-
-Desde TMSH:
-
-```bash
-tmsh list ltm pool pool_http_app
-```
-
-Salida esperada:
-
-```
-ltm pool pool_http_app {
-    load-balancing-mode round-robin
-    members {
-        web01:http {
-            address 10.20.20.11
-        }
-        web02:http {
-            address 10.20.20.12
-        }
-    }
-    monitor monitor_http_app
-}
-```
-
-Confirma que el `load-balancing-mode` es `round-robin`, que ambos miembros están presentes con puerto `http` (80) y que el monitor es `monitor_http_app`.
-
-### Paso 4: Verificar el estado de los Pool Members
-
-**Objetivo:** Confirmar que el Health Monitor HTTP está validando correctamente ambos backends y que BIG-IP los marca como disponibles (Available).
-
-**Instrucciones:**
-
-1. En TMUI, navega a **Local Traffic → Pools → Pool List**.
-2. Haz clic en el nombre del Pool `pool_http_app`.
-3. Selecciona la pestaña **Members**.
-4. Observa la columna **Status** de cada miembro. Ambos deben mostrar un círculo verde con la leyenda **Available (Enabled)**.
-
-   > **Si algún miembro aparece en rojo (Offline) o azul (Unknown):** Espera al menos 20 segundos (4 ciclos del monitor con intervalo de 5 s) y recarga la página. Si persiste, consulta la sección **Solución de Problemas** al final de este documento.
-
-5. Navega a **Statistics → Module Statistics → Local Traffic** y selecciona **Pools** en el menú desplegable de tipo de estadística.
-6. Haz clic en el nombre del Pool `pool_http_app` para ver las estadísticas por miembro.
-7. Verifica que la columna **Status** muestra verde para ambos miembros.
-
-**Resultado esperado:**
-
-Ambos Pool Members (`web01:80` y `web02:80`) muestran estado **Available (Enabled)** — círculo verde. Las columnas de estadísticas de tráfico muestran `0` en este momento porque aún no se ha enviado tráfico de aplicación.
-
-**Verificación:**
-
-Desde TMSH:
-
-```bash
-tmsh show ltm pool pool_http_app members
-```
-
-Salida esperada (extracto relevante para cada miembro):
-
-```
-Ltm::Pool: pool_http_app
-  Availability     : available
-  State            : enabled
-  ...
-  Pool Member:
-    web01:http
-      Addr            : 10.20.20.11
-      Port            : 80
-      Availability    : available
-      State           : enabled
-      Monitor Status  : up
-    web02:http
-      Addr            : 10.20.20.12
-      Port            : 80
-      Availability    : available
-      State           : enabled
-      Monitor Status  : up
-```
-
-Confirma que `Availability` es `available` y `Monitor Status` es `up` para ambos miembros.
-
-### Paso 5: Crear el Virtual Server
-
-**Objetivo:** Crear un Virtual Server de tipo Standard que exponga la aplicación web en la VIP `10.10.10.100:80` en la red externa, asociando el Pool, el perfil TCP y el perfil HTTP.
-
-**Instrucciones:**
-
-1. En TMUI, navega a **Local Traffic → Virtual Servers → Virtual Server List**.
-2. Haz clic en **Create**.
-3. Configura el Virtual Server con los siguientes valores:
-
-   | Campo | Valor |
-   |---|---|
-   | Name | `vs_http_app` |
-   | Type | `Standard` |
-   | Destination Address/Mask | `10.10.10.100` |
-   | Service Port | `80` (o `HTTP`) |
-   | Protocol | `TCP` |
-
-4. En la sección **Configuration** (selecciona **Advanced** en el menú desplegable si los campos no son visibles):
-
-   | Campo | Valor |
-   |---|---|
-   | HTTP Profile (Client) | `http` |
-   | Source Address Translation | `Auto Map` |
-
-   > **Nota sobre SNAT Auto Map:** Esta configuración es necesaria porque los servidores backend tienen como gateway predeterminado el Self IP interno del BIG-IP (`10.20.20.245`). Auto Map traduce la dirección de origen del cliente a la dirección del Self IP de la VLAN internal del BIG-IP, asegurando que el tráfico de retorno pase por el BIG-IP. Sin esta configuración, los servidores backend podrían intentar responder directamente al cliente, causando asimetría de tráfico.
-
-5. En la sección **Resources**:
-
-   | Campo | Valor |
-   |---|---|
-   | Default Pool | `pool_http_app` |
-
-6. Verifica que el perfil TCP (`tcp`) esté incluido en la lista de perfiles. BIG-IP lo añade automáticamente al seleccionar el protocolo TCP; si no aparece, añádelo manualmente desde la sección de perfiles.
-7. Haz clic en **Finished**.
-
-**Resultado esperado:**
-
-El Virtual Server `vs_http_app` aparece en la lista con estado verde (Available), indicando que tiene un Pool asociado con al menos un miembro disponible.
-
-**Verificación:**
-
-Desde TMSH:
-
-```bash
-tmsh list ltm virtual vs_http_app
-```
-
-Salida esperada (campos relevantes):
-
-```
-ltm virtual vs_http_app {
-    destination 10.10.10.100:http
-    ip-protocol tcp
-    mask 255.255.255.255
-    pool pool_http_app
-    profiles {
-        http { }
-        tcp { }
-    }
-    source-address-translation {
-        type automap
-    }
-}
-```
-
-Confirma: `destination` es `10.10.10.100:http`, `pool` es `pool_http_app`, los perfiles `http` y `tcp` están presentes, y `source-address-translation` es `automap`.
-
-Verifica el estado operativo:
-
-```bash
-tmsh show ltm virtual vs_http_app
-```
-
-Confirma que `Availability` muestra `available` y `State` muestra `enabled`.
-
-### Paso 6: Validar la distribución de tráfico Round Robin
-
-**Objetivo:** Confirmar que el tráfico HTTP enviado a la VIP se distribuye de forma alternada entre ambos backends, verificando el funcionamiento del método Round Robin.
-
-**Instrucciones:**
-
-1. Desde el **cliente de pruebas** (`10.10.10.10`), abre una terminal.
-2. Ejecuta el siguiente comando 6 veces consecutivas:
-
-   ```bash
-   curl http://10.10.10.100
-   ```
-
-3. Observa el contenido de cada respuesta. Las páginas `index.html` de cada servidor están personalizadas por el instructor, por lo que deberías ver respuestas alternadas que identifican a `web01` y `web02`.
-
-4. Para una verificación más estructurada, ejecuta un bucle:
-
-   ```bash
-   for i in $(seq 1 6); do echo "--- Solicitud $i ---"; curl -s http://10.10.10.100; echo; done
-   ```
-
-**Resultado esperado:**
-
-Las respuestas deben alternar entre los dos servidores. Con Round Robin, el patrón esperado es:
-
-```
---- Solicitud 1 ---
-Respuesta de web01 (o contenido identificativo de 10.20.20.11)
---- Solicitud 2 ---
-Respuesta de web02 (o contenido identificativo de 10.20.20.12)
---- Solicitud 3 ---
-Respuesta de web01
---- Solicitud 4 ---
-Respuesta de web02
---- Solicitud 5 ---
-Respuesta de web01
---- Solicitud 6 ---
-Respuesta de web02
-```
-
-> **Nota:** La alternancia perfecta 1:1 depende de que no existan conexiones persistentes HTTP keep-alive que reutilicen la misma conexión TCP para múltiples solicitudes. El comando `curl` por defecto cierra la conexión después de cada solicitud, lo que favorece la distribución Round Robin observable. Si observas que todas las respuestas provienen del mismo servidor, consulta la sección de Solución de Problemas.
-
-**Verificación:**
-
-Verifica las estadísticas del Pool desde TMUI:
-
-1. Navega a **Statistics → Module Statistics → Local Traffic**.
-2. Selecciona **Pools** y haz clic en `pool_http_app`.
-3. Confirma que ambos miembros muestran valores similares en las columnas **Total Requests** (la diferencia no debe ser mayor a 1 solicitud).
-
-Desde TMSH:
-
-```bash
-tmsh show ltm pool pool_http_app members
-```
-
-Busca los contadores `Total requests` para cada miembro. Tras 6 solicitudes con Round Robin, cada miembro debería mostrar aproximadamente 3 solicitudes.
-
-### Paso 7: Simular la caída de un Pool Member
-
-**Objetivo:** Verificar que el Health Monitor detecta la indisponibilidad de un backend y que BIG-IP redirige automáticamente todo el tráfico al miembro sano restante.
-
-**Instrucciones:**
-
-1. Desde la estación de administración, abre una sesión SSH hacia `web01`:
-
-   ```bash
-   ssh usuario@10.20.20.11
-   ```
-
-   > Utiliza las credenciales proporcionadas por el instructor para los servidores backend.
-
-2. Detén el servicio Apache en `web01`:
-
-   ```bash
-   sudo systemctl stop apache2
-   ```
-
-3. Confirma que Apache está detenido:
-
-   ```bash
-   sudo systemctl status apache2
-   ```
-
-   Resultado esperado: `Active: inactive (dead)`.
-
-4. Espera al menos **20 segundos** para que el Health Monitor del BIG-IP detecte el fallo (Timeout de 16 segundos + margen).
-
-5. En TMUI del BIG-IP, navega a **Local Traffic → Pools → pool_http_app → Members**.
-
-6. Observa el estado de `web01:80`: debe mostrar un círculo rojo con estado **Offline**.
-
-7. Observa el estado de `web02:80`: debe permanecer verde con estado **Available (Enabled)**.
-
-8. Observa el estado general del Pool `pool_http_app`: debe permanecer **Available** (amarillo o verde) porque al menos un miembro está disponible.
-
-9. Desde el **cliente de pruebas**, ejecuta nuevamente el bucle de solicitudes:
-
-   ```bash
-   for i in $(seq 1 6); do echo "--- Solicitud $i ---"; curl -s http://10.10.10.100; echo; done
-   ```
-
-**Resultado esperado:**
-
-Todas las 6 respuestas provienen exclusivamente de `web02` (10.20.20.12). Ninguna solicitud falla con error de conexión; BIG-IP absorbe el fallo del backend de forma transparente para el cliente.
-
-```
---- Solicitud 1 ---
-Respuesta de web02
---- Solicitud 2 ---
-Respuesta de web02
-...
---- Solicitud 6 ---
-Respuesta de web02
-```
-
-**Verificación:**
-
-Desde TMSH:
-
-```bash
-tmsh show ltm pool pool_http_app members
-```
-
-Salida esperada (extracto):
-
-```
-  Pool Member:
-    web01:http
-      Availability    : offline
-      State           : enabled
-      Monitor Status  : down
-    web02:http
-      Availability    : available
-      State           : enabled
-      Monitor Status  : up
-```
-
-Confirma que `web01:http` tiene `Monitor Status: down` y `Availability: offline`, mientras `web02:http` permanece `up` y `available`.
-
-Verifica también en los logs del BIG-IP:
-
-```bash
-tmsh show sys log ltm | grep pool_http_app | tail -5
-```
-
-Deberías observar una entrada indicando que el miembro `web01:80` fue marcado como `down` por el monitor.
-
-### Paso 8: Restaurar el Pool Member y verificar la recuperación automática
-
-**Objetivo:** Confirmar que al restaurar el servicio en el backend, el Health Monitor lo detecta automáticamente y BIG-IP vuelve a incluirlo en la distribución de tráfico.
-
-**Instrucciones:**
-
-1. En la sesión SSH a `web01` (`10.20.20.11`), reinicia Apache:
-
-   ```bash
-   sudo systemctl start apache2
-   ```
-
-2. Confirma que Apache está activo:
-
-   ```bash
-   sudo systemctl status apache2
-   ```
-
-   Resultado esperado: `Active: active (running)`.
-
-3. Espera al menos **10 segundos** (2 ciclos del monitor con intervalo de 5 s) para que BIG-IP detecte la recuperación.
-
-4. En TMUI, navega a **Local Traffic → Pools → pool_http_app → Members**.
-
-5. Verifica que `web01:80` ha vuelto al estado verde **Available (Enabled)**.
-
-6. Desde el **cliente de pruebas**, ejecuta nuevamente el bucle:
-
-   ```bash
-   for i in $(seq 1 6); do echo "--- Solicitud $i ---"; curl -s http://10.10.10.100; echo; done
-   ```
-
-**Resultado esperado:**
-
-Las respuestas vuelven a alternar entre `web01` y `web02`, confirmando que Round Robin distribuye el tráfico entre ambos backends restaurados.
-
-**Verificación:**
-
-Desde TMSH:
-
-```bash
-tmsh show ltm pool pool_http_app members
-```
-
-Ambos miembros deben mostrar `Availability: available`, `State: enabled` y `Monitor Status: up`.
-
-Verifica los logs para confirmar la recuperación:
-
-```bash
-tmsh show sys log ltm | grep pool_http_app | tail -5
-```
-
-Deberías observar una entrada indicando que el miembro `web01:80` fue marcado como `up`.
-
-### Paso 9: Guardar la configuración
-
-**Objetivo:** Persistir todos los cambios realizados en la configuración del BIG-IP para que sobrevivan a un reinicio, ya que los resultados de este laboratorio son el estado inicial requerido para los laboratorios subsiguientes.
-
-**Instrucciones:**
-
-1. Desde TMSH en el BIG-IP:
-
-   ```bash
-   tmsh save sys config
-   ```
-
-   Resultado esperado:
-
-   ```
-   Saving running configuration...
-     /config/bigip.conf
-     /config/bigip_base.conf
-     /config/bigip_user.conf
-   ```
-
-2. Alternativamente, desde TMUI: navega a **System → Archives** y verifica que puedes crear un archivo UCS si el instructor lo solicita.
-
-**Resultado esperado:**
-
-La configuración queda persistida. Los objetos `web01`, `web02`, `monitor_http_app`, `pool_http_app` y `vs_http_app` estarán disponibles tras un reinicio del BIG-IP.
-
-**Verificación:**
-
-```bash
-tmsh list ltm virtual vs_http_app
-tmsh list ltm pool pool_http_app
-tmsh list ltm monitor http monitor_http_app
-tmsh list ltm node web01
-tmsh list ltm node web02
-```
-
-Todos los comandos deben devolver la configuración creada durante el laboratorio.
-
-## Validación y Pruebas
-
-Completa la siguiente tabla de validación. Cada criterio debe verificarse con evidencia concreta (comando ejecutado y salida obtenida):
-
-| # | Criterio de validación | Comando/Método | Resultado esperado | ¿Cumplido? |
-|---|---|---|---|---|
-| 1 | Nodes `web01` y `web02` existen con IPs correctas | `tmsh list ltm node` | Dos Nodes: `10.20.20.11` y `10.20.20.12` | ☐ |
-| 2 | Monitor `monitor_http_app` configurado correctamente | `tmsh list ltm monitor http monitor_http_app` | Interval=5, Timeout=16, Send String con GET HTTP/1.1 | ☐ |
-| 3 | Pool `pool_http_app` con 2 miembros, Round Robin y monitor | `tmsh list ltm pool pool_http_app` | `round-robin`, 2 miembros `:http`, monitor `monitor_http_app` | ☐ |
-| 4 | Ambos Pool Members en estado Available | `tmsh show ltm pool pool_http_app members` | `Availability: available` y `Monitor Status: up` para ambos | ☐ |
-| 5 | Virtual Server `vs_http_app` operativo | `tmsh show ltm virtual vs_http_app` | `Availability: available`, destination `10.10.10.100:http` | ☐ |
-| 6 | Tráfico distribuido entre ambos backends | `for i in $(seq 1 6); do curl -s http://10.10.10.100; done` | Respuestas alternadas de web01 y web02 | ☐ |
-| 7 | Failover: tráfico redirigido al miembro sano | Detener Apache en web01 + `curl` | Solo respuestas de web02, sin errores | ☐ |
-| 8 | Recuperación: miembro restaurado automáticamente | Iniciar Apache en web01 + esperar + `curl` | Respuestas alternadas restauradas | ☐ |
-| 9 | Configuración persistida | `tmsh save sys config` + `tmsh list ltm virtual` | Configuración presente tras guardar | ☐ |
-
-### Prueba adversarial: solicitud a VIP inexistente
-
-Para verificar que el comportamiento del BIG-IP es predecible y que no se producen respuestas inesperadas:
-
-```bash
-curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 http://10.10.10.200
-```
-
-**Resultado esperado:** El comando debería fallar con timeout o conexión rechazada (código `000` o error de conexión), ya que `10.10.10.200` no tiene un Virtual Server configurado. Esto confirma que BIG-IP solo responde en las VIPs explícitamente definidas y no actúa como proxy abierto.
-
-### Prueba adversarial: solicitud con método HTTP no estándar
-
-```bash
-curl -s -X DELETE http://10.10.10.100/
-```
-
-**Resultado esperado:** El servidor backend responde (probablemente con un error `405 Method Not Allowed` o una respuesta `200` según la configuración de Apache). Lo importante es verificar que BIG-IP reenvía la solicitud al Pool y no la bloquea, ya que no se han configurado políticas de seguridad de capa 7. Esto demuestra que el perfil HTTP por defecto no filtra métodos.
-
-## Solución de Problemas
-
-### Problema 1: Pool Members permanecen en estado Offline (rojo) tras crear el Pool
-
-**Síntomas:**
-
-- En TMUI, los Pool Members muestran un círculo rojo con estado **Offline**.
-- `tmsh show ltm pool pool_http_app members` muestra `Monitor Status: down` para uno o ambos miembros.
-- Las solicitudes `curl http://10.10.10.100` desde el cliente devuelven un error o una página de reset de conexión.
-
-**Causa:**
-
-El Health Monitor HTTP no puede alcanzar los servidores backend. Las causas más frecuentes son:
-
-1. **Apache no está ejecutándose** en los servidores backend.
-2. **Problema de conectividad de red** entre el Self IP interno del BIG-IP (`10.20.20.245`) y los servidores backend (`10.20.20.11`, `10.20.20.12`).
-3. **El Send String del monitor contiene un error de formato** (por ejemplo, falta la secuencia final `\r\n\r\n`).
-
-**Solución:**
-
-1. Verifica que Apache está activo en ambos backends:
-
-   ```bash
-   ssh usuario@10.20.20.11 "sudo systemctl status apache2"
-   ssh usuario@10.20.20.12 "sudo systemctl status apache2"
-   ```
-
-   Si Apache está detenido, inícialo: `sudo systemctl start apache2`.
-
-2. Desde el BIG-IP, verifica conectividad HTTP directa a los backends:
-
-   ```bash
-   curl -v http://10.20.20.11/
-   curl -v http://10.20.20.12/
-   ```
-
-   Si falla, verifica la configuración de Self IP y VLAN internal:
-
-   ```bash
-   tmsh list net self internal_self_ip
-   tmsh list net vlan vlan_internal
-   ```
-
-3. Revisa la configuración del monitor:
-
-   ```bash
-   tmsh list ltm monitor http monitor_http_app
-   ```
-
-   Verifica que el campo `send` contiene exactamente: `"GET / HTTP/1.1\r\nHost: app.lab.local\r\nConnection: close\r\n\r\n"`. Si es incorrecto, modifícalo:
-
-   ```bash
-   tmsh modify ltm monitor http monitor_http_app send "GET / HTTP/1.1\r\nHost: app.lab.local\r\nConnection: close\r\n\r\n"
-   ```
-
-### Problema 2: Todas las respuestas de curl provienen del mismo servidor (sin alternancia Round Robin)
-
-**Síntomas:**
-
-- `curl http://10.10.10.100` ejecutado 6 veces devuelve siempre la respuesta del mismo backend (por ejemplo, siempre `web01`).
-- Ambos Pool Members aparecen como Available (verde) en TMUI.
-- Las estadísticas del Pool muestran que solo un miembro acumula solicitudes.
-
-**Causa:**
-
-Las causas más probables son:
-
-1. **Source Address Translation (SNAT) no configurada como Auto Map.** Sin SNAT, el tráfico de retorno del backend puede no pasar por el BIG-IP, causando que el BIG-IP no vea las respuestas y reintente siempre con el mismo miembro.
-2. **OneConnect o perfil de multiplexación activo** que reutiliza conexiones del lado servidor, haciendo que múltiples solicitudes del cliente se envíen por la misma conexión backend.
-3. **Persistence profile accidentalmente asociado** al Virtual Server, forzando que un mismo cliente siempre se dirija al mismo backend.
-
-**Solución:**
-
-1. Verifica la configuración de SNAT en el Virtual Server:
-
-   ```bash
-   tmsh list ltm virtual vs_http_app source-address-translation
-   ```
-
-   Si no muestra `type automap`, corrige:
-
-   ```bash
-   tmsh modify ltm virtual vs_http_app source-address-translation { type automap }
-   ```
-
-2. Verifica que no hay perfil de persistencia asociado:
-
-   ```bash
-   tmsh list ltm virtual vs_http_app persist
-   ```
-
-   Si muestra algún perfil de persistencia, elimínalo:
-
-   ```bash
-   tmsh modify ltm virtual vs_http_app persist none
-   ```
-
-3. Verifica que no hay perfil OneConnect:
-
-   ```bash
-   tmsh list ltm virtual vs_http_app profiles
-   ```
-
-   Si aparece un perfil `oneconnect`, elimínalo:
-
-   ```bash
-   tmsh modify ltm virtual vs_http_app profiles delete { oneconnect }
-   ```
-
-4. Tras los cambios, reinicia las estadísticas y prueba nuevamente:
-
-   ```bash
-   tmsh reset-stats ltm pool pool_http_app
-   ```
-
-   Luego ejecuta el bucle de `curl` desde el cliente y verifica la alternancia.
-
-## Limpieza
-
-> **IMPORTANTE:** No ejecutes estos comandos de limpieza si vas a continuar con los laboratorios subsiguientes del módulo (Persistence Profiles, SSL). Los objetos creados en este laboratorio son el estado inicial requerido para esos laboratorios.
-
-Si el instructor indica que se debe limpiar el entorno, ejecuta los siguientes comandos en orden desde TMSH en el BIG-IP:
-
-```bash
-## 1. Eliminar el Virtual Server (depende del Pool)
-tmsh delete ltm virtual vs_http_app
-
-## 2. Eliminar el Pool (depende de los Pool Members y del Monitor)
-tmsh delete ltm pool pool_http_app
-
-## 3. Eliminar el Health Monitor
-tmsh delete ltm monitor http monitor_http_app
-
-## 4. Eliminar los Nodes
-tmsh delete ltm node web01
-tmsh delete ltm node web02
-
-## 5. Guardar la configuración limpia
-tmsh save sys config
-```
-
-Verificación de limpieza:
-
-```bash
-tmsh list ltm virtual
-tmsh list ltm pool
-tmsh list ltm monitor http monitor_http_app
-tmsh list ltm node
-```
-
-Todos los comandos deben devolver salida vacía o un error indicando que el objeto no existe.
-
-Confirma que Apache sigue activo en ambos backends (no debe quedar detenido tras la prueba del Paso 7):
-
-```bash
-ssh usuario@10.20.20.11 "sudo systemctl status apache2 | grep Active"
-ssh usuario@10.20.20.12 "sudo systemctl status apache2 | grep Active"
-```
-
-Resultado esperado: `Active: active (running)` en ambos servidores.
-
-## Resumen
-
-En este laboratorio has construido la cadena completa de publicación de una aplicación web a través de F5 BIG-IP LTM:
-
-1. **Nodes** — Registraste los servidores backend como objetos reutilizables identificados por IP y nombre descriptivo.
-2. **Health Monitor HTTP** — Definiste una comprobación activa que valida la respuesta HTTP real de cada backend, no solo la conectividad TCP.
-3. **Pool con Pool Members** — Agrupaste los servicios HTTP de ambos backends, asignaste Round Robin como método de balanceo y asociaste el monitor para evaluación automática de disponibilidad.
-4. **Virtual Server** — Expusiste la aplicación en una VIP accesible desde la red externa, con perfiles TCP y HTTP y traducción de direcciones (Auto Map).
-5. **Validación extremo a extremo** — Confirmaste la distribución de tráfico, la detección automática de fallos y la recuperación sin intervención manual.
-
-### Conceptos clave reforzados
-
-- La relación jerárquica **Node → Pool Member → Pool → Virtual Server** define cómo BIG-IP organiza los destinos de tráfico.
-- El **service port** en el Pool Member determina el servicio específico al que BIG-IP envía tráfico; puede diferir del puerto expuesto al cliente.
-- La **disponibilidad se propaga por dependencia**: si un backend falla, su Pool Member se marca Offline; si todos los miembros fallan, el Pool se marca como no disponible.
-- **Round Robin** distribuye solicitudes de forma secuencial entre los miembros disponibles, proporcionando una distribución equitativa cuando los backends tienen capacidad similar.
-- **Auto Map (SNAT)** es necesario para garantizar que el tráfico de retorno pase por el BIG-IP cuando los backends usan el Self IP interno como gateway.
-
-### Recursos adicionales
-
-| Recurso | URL |
-|---|---|
-| Documentación F5: Pools y Pool Members LTM | https://clouddocs.f5.com/products/big-ip_ltm/manuals/product/ltm-basics-12-1-0/4.html |
-| Referencia TMSH: ltm pool | https://clouddocs.f5.com/cli/tmsh-reference/latest/modules/ltm/ltm_pool.html |
-| Referencia TMSH: ltm node | https://clouddocs.f5.com/cli/tmsh-reference/latest/modules/ltm/ltm_node.html |
-| Referencia TMSH: ltm monitor http | https://clouddocs.f5.com/cli/tmsh-reference/latest/modules/ltm/ltm_monitor_http.html |
-| Referencia TMSH: ltm virtual | https://clouddocs.f5.com/cli/tmsh-reference/latest/modules/ltm/ltm_virtual.html |
-| K13637: Health Monitor troubleshooting | https://my.f5.com/manage/s/article/K13637 |
+**Nota de lectura:** las dos VIP utilizan la IP externa que ya está asignada a BIG-IP, pero escuchan en puertos distintos. Los pools pueden utilizar los mismos servidores sin duplicar máquinas virtuales. La configuración de los objetos LTM determina cómo se reparte el tráfico de cada servicio.
+
+## Distribución del tiempo
+
+| Actividad | Minutos |
+|---|---:|
+| 1. Verificación y línea base | 5 |
+| 2. Monitor HTTP y pool independiente | 10 |
+| 3. Publicación del segundo Virtual Server | 7 |
+| 4. Comparación Round Robin vs. Ratio 3:1 | 12 |
+| 5. Diagnóstico TCP vs. HTTP | 12 |
+| 6. Mantenimiento de un Pool Member | 9 |
+| 7. Recuperación y validación | 5 |
+| **Total** | **60** |
 
 ---
 
+## Paso 1. Verificar que el entorno está preparado (5 minutos)
+
+**Objetivo:** confirmar que el servicio del Laboratorio 3 funciona y que el puerto `8081` está libre.
+
+**Desde Ubuntu Bash**, ejecuta:
+
+```bash
+curl -sS -o /dev/null -w 'Lab3 HTTP: %{http_code}\n' --connect-timeout 5 http://10.1.3.200:8080/
+curl -sS -o /dev/null -w 'Puerto 8081 antes: %{http_code}\n' --connect-timeout 3 --max-time 5 http://10.1.3.200:8081/
+```
+
+- La primera solicitud debe devolver normalmente `200` si el servicio anterior funciona.
+- La segunda debe fallar o devolver `000` si no existe un listener en `8081`. **No se espera necesariamente un mensaje específico:** puede haber timeout o rechazo de conexión.
+
+**Desde BIG-IP TMSH**, confirma:
+
+```text
+list ltm virtual
+show ltm pool
+list net self External-IP
+```
+
+Comprueba que la Self IP externa sigue siendo `10.1.3.200` y que ninguna configuración existente utiliza el destino `10.1.3.200:8081`.
+
+**Criterio para continuar:** el servicio anterior funciona y la nueva combinación IP:puerto está disponible. Si ya existe un Virtual Server en `8081`, no lo sobrescribas; detén esta actividad para evitar modificar un servicio ajeno.
+
+## Paso 2. Crear un monitor HTTP y un pool independiente (10 minutos)
+
+**Problema que resuelve:** un balanceador necesita distinguir entre un servidor que acepta conexiones y un servidor que realmente devuelve la respuesta esperada de su aplicación.
+
+### 2.1 Crear el monitor
+
+En TMUI, abre **Local Traffic → Monitors → Create**. Establece:
+
+| Campo | Valor |
+|---|---|
+| Name | `mon_http_lab04` |
+| Type | `HTTP` |
+| Interval | `5` segundos |
+| Timeout | `16` segundos |
+| Send String | `GET / HTTP/1.0\r\n\r\n` |
+| Receive String | `200 OK` |
+
+Guarda con **Finished**. En algunas versiones, el formulario requiere seleccionar **Advanced** para mostrar todos los campos.
+
+**Desde TMSH**:
+
+```text
+list ltm monitor http mon_http_lab04
+```
+
+Verifica que `send` incluya la secuencia final `\r\n\r\n` y que `recv` sea `200 OK`.
+
+### 2.2 Crear el pool
+
+En TMUI, abre **Local Traffic → Pools → Pool List → Create**:
+
+| Campo | Valor |
+|---|---|
+| Name | `pool_lab04` |
+| Health Monitors | `mon_http_lab04` (mover a Active) |
+| Load Balancing Method | `Round Robin` |
+| Member 1 | `10.1.2.4` / puerto `80` |
+| Member 2 | `10.1.2.5` / puerto `80` |
+
+Pulsa **Add** después de capturar cada miembro, y finalmente **Finished**. Si los nodos ya existen por el Laboratorio 3, selecciónalos desde la lista de nodos: no es necesario duplicarlos.
+
+**Desde TMSH**:
+
+```text
+list ltm pool pool_lab04
+show ltm pool pool_lab04 members
+```
+
+**Resultado esperado:** ambos miembros disponibles después de los primeros ciclos del monitor. Si alguno aparece Offline, comprueba el acceso HTTP directo desde **BIG-IP TMSH** (sin entrar a Bash):
+
+```text
+run util bash -c "curl -I http://10.1.2.4/"
+run util bash -c "curl -I http://10.1.2.5/"
+```
+
+En cada servidor Apache se espera una línea semejante a `HTTP/1.1 200 OK`. El parámetro `-I` envía una solicitud **HEAD**, mientras que el monitor del pool envía **GET**. Si el servidor devuelve un código diferente o no acepta HEAD, comprueba la respuesta GET mediante:
+
+```text
+run util bash -c "curl -sS -o /dev/null -w '%{http_code}\n' http://10.1.2.4/"
+run util bash -c "curl -sS -o /dev/null -w '%{http_code}\n' http://10.1.2.5/"
+```
+
+**Criterio para continuar:** los dos servidores responden a GET con `200` y ambos miembros del pool están disponibles. Si GET funciona y el monitor marca Offline, revisa la configuración del monitor antes de continuar.
+
+## Paso 3. Publicar un segundo Virtual Server (7 minutos)
+
+**Problema que resuelve:** publicar dos servicios lógicos diferentes utilizando los mismos recursos físicos, con políticas de entrega independientes.
+
+En TMUI, abre **Local Traffic → Virtual Servers → Virtual Server List → Create**:
+
+| Campo | Valor |
+|---|---|
+| Name | `vs_lab04` |
+| Type | `Standard` |
+| Destination Address/Mask | `10.1.3.200` / máscara de host (`255.255.255.255`) |
+| Service Port | `8081` |
+| Protocol | `TCP` |
+| HTTP Profile (Client) | `http` |
+| TCP Profile | `tcp` (predeterminado, confirmar) |
+| Source Address Translation | `Auto Map` |
+| Default Pool | `pool_lab04` |
+
+Selecciona **Advanced** si necesitas mostrar perfiles y traducción de origen. Finaliza la creación.
+
+**En BIG-IP TMSH**:
+
+```text
+list ltm virtual vs_lab04
+show ltm virtual vs_lab04
+```
+
+Confirma `destination ...:8081`, el pool `pool_lab04`, un perfil TCP, un perfil HTTP y `source-address-translation { type automap }`.
+
+**En Ubuntu Bash**:
+
+```bash
+curl -v --connect-timeout 5 http://10.1.3.200:8081/
+curl -sS -o /dev/null -w 'Lab3: %{http_code}\n' http://10.1.3.200:8080/
+```
+
+**Resultado esperado:** el servicio nuevo devuelve `HTTP 200`; el servicio anterior continúa respondiendo. El segundo `curl` permite detectar accidentalmente un cambio que afectó el laboratorio anterior.
+
+## Paso 4. Comparar Round Robin y Ratio (Member) (12 minutos)
+
+**Problema que resuelve:** cuando los dos servidores tienen capacidades distintas, repartir las conexiones por igual puede no ser la mejor política. Ratio permite asignar pesos estáticos.
+
+### 4.1 Línea base con Round Robin
+
+Desde **Ubuntu Bash** ejecuta 40 solicitudes independientes. Cada ejecución de `curl` crea un proceso nuevo para reducir la reutilización de conexiones del cliente:
+
+```bash
+for i in $(seq 1 40); do
+  curl -sS -o /dev/null --connect-timeout 5 --max-time 10 \
+    -H 'Connection: close' "http://10.1.3.200:8081/?rr=$i"
+done
+```
+
+En TMUI abre **Statistics → Module Statistics → Local Traffic → Pools** y selecciona `pool_lab04` (la ubicación concreta de estadísticas puede variar). Compara el incremento de conexiones/solicitudes de ambos miembros. También puedes usar:
+
+```text
+show ltm pool pool_lab04 members
+```
+
+**Interpretación:** con ambos miembros sanos, Round Robin debería aproximarse a una distribución 50/50 de *nuevas conexiones*. Los contadores son acumulativos: registra el valor antes y después de la prueba, en lugar de esperar que sean exactamente 20 y 20.
+
+### 4.2 Cambiar a Ratio (Member)
+
+En esta versión de TMUI, el método de balanceo y los miembros se administran desde la pestaña **Members** del pool. Los valores mostrados en la columna **Ratio** son informativos; para modificarlos debes abrir cada miembro.
+
+1. Abre **Local Traffic → Pools → Pool List** y haz clic en **`pool_lab04`**.
+2. Selecciona la pestaña **Members**.
+3. En la sección superior **Load Balancing**, despliega **Load Balancing Method** y selecciona **Ratio (member)**.
+4. Haz clic en **Update**, justo debajo de esa sección. Esto guarda el método del pool, **pero todavía no cambia los ratios de los servidores**.
+5. En la tabla **Current Members**, haz clic en el enlace **`10.1.2.4:80`** (columna **Member**). En la pantalla de propiedades del miembro localiza **Ratio**, establece **3** y pulsa **Update**.
+6. Regresa a **`pool_lab04` → Members**. Haz clic en **`10.1.2.5:80`**, establece **Ratio = 1** y guarda con **Update**.
+7. Regresa a la pestaña **Members** y comprueba los valores de ambas filas:
+
+| Miembro | Ratio configurado | Interpretación |
+|---|---:|---|
+| `10.1.2.4:80` (web01) | 3 | Peso relativo de tres unidades |
+| `10.1.2.5:80` (web02) | 1 | Peso relativo de una unidad |
+
+**Importante:** no utilices **Priority Group** ni **Connection Limit** para esta actividad; son parámetros diferentes. **Priority Group Activation** permanece en **Disabled**.
+
+**Desde BIG-IP TMSH**, verifica el método y los pesos:
+
+```text
+list ltm pool pool_lab04
+```
+
+Localiza `load-balancing-mode ratio-member` y, dentro de `members`, el valor `ratio 3` correspondiente a `10.1.2.4:80`. El segundo miembro conserva `ratio 1` (su valor predeterminado puede no mostrarse explícitamente en la salida).
+
+**Criterio de éxito:** TMUI muestra **Ratio (member)** como método y la columna **Ratio** muestra **3** y **1**, respectivamente. La tabla de miembros también debe mostrar ambos indicadores de estado en verde antes de comenzar la medición.
+
+Repite 40 solicitudes nuevas desde Ubuntu:
+
+```bash
+for i in $(seq 1 40); do
+  curl -sS -o /dev/null --connect-timeout 5 --max-time 10 \
+    -H 'Connection: close' "http://10.1.3.200:8081/?ratio=$i"
+done
+```
+
+Anota los incrementos de los contadores de miembros. **Resultado esperado:** una tendencia cercana al 75% para web01 y 25% para web02; no exijas 30/10 exactos porque la selección y los contadores pueden depender de conexiones existentes y del tráfico de fondo.
+
+**Pregunta de análisis:** ¿cuándo convendría una relación 3:1 en producción? Ejemplo: un servidor con mayor capacidad de CPU o memoria que otro.
+
+## Paso 5. Diagnóstico: ¿TCP disponible significa aplicación saludable? (12 minutos)
+
+**Objetivo:** demostrar que un monitor TCP puede declarar disponible un servicio cuyo recurso HTTP específico falla. No detendremos Apache ni modificaremos el sistema operativo de los backends.
+
+### 5.1 Registrar el funcionamiento correcto
+
+En BIG-IP TMSH:
+
+```text
+show ltm pool pool_lab04 members
+list ltm monitor http mon_http_lab04
+```
+
+Ambos miembros deben estar disponibles; el monitor envía `GET /` y exige `200 OK`.
+
+### 5.2 Introducir una falla controlada en la comprobación de aplicación
+
+En TMUI navega a **Local Traffic → Monitors → mon_http_lab04** y cambia **Send String** a:
+
+```text
+GET /lab04-ruta-inexistente HTTP/1.0\r\n\r\n
+```
+
+Mantén **Receive String** = `200 OK`. Pulsa **Update**.
+
+Esto hace que el monitor solicite un recurso que normalmente no existe. Apache suele responder `404 Not Found`; el puerto TCP/80 puede seguir abierto, pero el monitor HTTP debe marcar a los miembros como no disponibles una vez vencido el timeout.
+
+En BIG-IP TMSH verifica:
+
+```text
+show ltm pool pool_lab04 members
+```
+
+**Desde Ubuntu Bash**, comprueba la diferencia mediante la nueva VIP:
+
+```bash
+curl -v --connect-timeout 5 --max-time 10 http://10.1.3.200:8081/
+```
+
+Si ambos miembros están Offline, el Virtual Server puede dejar de atender correctamente solicitudes; el tipo exacto de error depende de la configuración y de cómo BIG-IP maneje conexiones existentes.
+
+### 5.3 Comparar con un monitor TCP
+
+En TMUI abre **Local Traffic → Pools → pool_lab04 → Properties**. Reemplaza temporalmente el monitor activo `mon_http_lab04` por el monitor integrado **`tcp`**, y pulsa **Update**.
+
+Espera unos ciclos y consulta:
+
+```text
+list ltm pool pool_lab04
+show ltm pool pool_lab04 members
+```
+
+**Resultado esperado:** si los servidores siguen aceptando TCP/80, los miembros vuelven a Available, aunque la ruta `/lab04-ruta-inexistente` no exista.
+
+Desde Ubuntu, prueba el recurso inexistente en el servicio nuevo:
+
+```bash
+curl -sS -o /dev/null -w 'Recurso inexistente HTTP: %{http_code}\n' \
+  http://10.1.3.200:8081/lab04-ruta-inexistente
+```
+
+Una respuesta `404` junto con un monitor TCP en verde demuestra que **alcanzabilidad TCP y salud de aplicación son cosas diferentes**.
+
+**Si la ruta inesperadamente existe o devuelve `200`,** elige otro nombre de ruta inexistente y vuelve a repetir el ensayo. El objetivo es comprobar la diferencia entre una respuesta HTTP no deseada y la apertura del puerto TCP.
+
+### 5.4 Restaurar el monitor HTTP correcto
+
+En TMUI, edita `mon_http_lab04` y restaura:
+
+```text
+GET / HTTP/1.0\r\n\r\n
+```
+
+En **Local Traffic → Pools → pool_lab04 → Properties**, vuelve a seleccionar exclusivamente `mon_http_lab04` como monitor activo y pulsa **Update**.
+
+Comprueba que ambos miembros vuelven a Available.
+
+**Concepto comprobado:** un monitor TCP responde «¿el servicio acepta conexiones?». Un monitor HTTP con cadena de recepción permite comprobar «¿el servicio devuelve la respuesta esperada?».
+
+## Paso 6. Mantenimiento controlado de un miembro (9 minutos)
+
+**Objetivo:** diferenciar un miembro averiado de uno que el administrador retira intencionalmente de la rotación.
+
+En TMUI abre **Local Traffic → Pools → pool_lab04 → Members**. Selecciona `10.1.2.5:80` y usa **Disable** (o la opción **Disabled** dentro del estado del miembro, según la versión).
+
+En TMSH:
+
+```text
+show ltm pool pool_lab04 members
+list ltm pool pool_lab04
+```
+
+**Observación:** el miembro retirado administrativamente puede seguir sano según el monitor, pero no debe recibir nuevas conexiones ordinarias. Las sesiones activas y ciertos casos con persistencia pueden conservarse. Por eso *Disabled* no equivale a «el servidor está averiado». <https://techdocs.f5.com/en-us/bigip-14-1-0/big-ip-local-traffic-management-basics-14-1-0/enabling-and-disabling-local-traffic-objects.html>
+
+Desde Ubuntu genera 12 solicitudes:
+
+```bash
+for i in $(seq 1 12); do
+  curl -sS -o /dev/null --connect-timeout 5 --max-time 10 \
+    -H 'Connection: close' "http://10.1.3.200:8081/?maintenance=$i"
+done
+```
+
+Consulta los contadores de ambos miembros. **Resultado esperado:** el miembro habilitado procesa las nuevas conexiones; el miembro deshabilitado deja de recibir conexiones ordinarias nuevas. Si los servidores muestran páginas idénticas, utiliza los contadores del pool para comprobarlo.
+
+**Compara los estados:**
+
+| Situación | Qué significa | Acción típica |
+|---|---|---|
+| Monitor HTTP falla | La comprobación de aplicación no es satisfactoria | Investigar aplicación, red o monitor |
+| Miembro Disabled | El administrador lo retira de nuevas conexiones ordinarias | Mantenimiento planificado |
+| Miembro Available y Enabled | Puede participar en el balanceo | Operación normal |
+
+**Recuperación obligatoria:** en TMUI, selecciona `10.1.2.5:80` y pulsa **Enable**. Verifica que ambos miembros están disponibles y habilitados.
+
+## Paso 7. Recuperar la configuración de referencia y validar (5 minutos)
+
+1. En **Local Traffic → Pools → Pool List → pool_lab04 → Members**, selecciona **Round Robin** en **Load Balancing Method** (sección **Load Balancing**) y pulsa **Update**.
+2. En **Current Members**, abre el enlace `10.1.2.4:80`, cambia **Ratio** a **1** y pulsa **Update**. Comprueba que `10.1.2.5:80` permanezca en **1**.
+3. Confirma que el monitor activo es **`mon_http_lab04`**, con `GET /` y `recv 200 OK`.
+4. Confirma que ambos miembros están **Enabled** y **Available**.
+5. Conserva el nuevo servicio `vs_lab04` para posteriores ejercicios; **no borres `vs_web_lab` ni alteres `10.1.3.200:8080`**.
+
+**Desde BIG-IP TMSH**:
+
+```text
+list ltm pool pool_lab04
+show ltm pool pool_lab04 members
+list ltm monitor http mon_http_lab04
+show ltm virtual vs_lab04
+save sys config
+```
+
+**Desde Ubuntu Bash**:
+
+```bash
+curl -sS -o /dev/null -w 'Lab3: %{http_code}\n' http://10.1.3.200:8080/
+curl -sS -o /dev/null -w 'Lab4: %{http_code}\n' http://10.1.3.200:8081/
+```
+
+**Criterio de éxito:** ambos servicios devuelven `200`; en `pool_lab04` hay dos miembros Available/Enabled, Round Robin y monitor HTTP activo.
+
+## Validación final
+
+| Evidencia | Resultado que debes comprobar | Completado |
+|---|---|---|
+| Segundo Virtual Server | `vs_lab04` escucha en `10.1.3.200:8081` | [ ] |
+| Monitor HTTP | `mon_http_lab04` envía `GET /` y exige `200 OK` | [ ] |
+| Pool independiente | `pool_lab04` tiene web01 y web02 | [ ] |
+| Round Robin | Los incrementos de distribución son aproximadamente equilibrados | [ ] |
+| Ratio 3:1 | web01 recibe mayor proporción de conexiones nuevas que web02 | [ ] |
+| Monitor HTTP fallido | Los miembros pueden marcarse Offline aunque el puerto TCP esté abierto | [ ] |
+| Monitor TCP | Los miembros pueden estar Available aunque un recurso HTTP devuelva `404` | [ ] |
+| Mantenimiento | Un miembro Disabled deja de recibir nuevas conexiones ordinarias | [ ] |
+| Recuperación | Monitores, ratios, estados y ambos servicios operativos | [ ] |
+
+## Solución de problemas
+
+### `8081` no responde después de crear el Virtual Server
+
+- Comprueba con `show ltm virtual vs_lab04` que está Enabled y Available.
+- Verifica `list ltm virtual vs_lab04` y que apunta a `pool_lab04`.
+- Comprueba que `show ltm pool pool_lab04 members` presenta al menos un miembro Available.
+- Confirma desde Ubuntu que la prueba usa **HTTP y puerto `8081`**, no HTTPS ni `8080`.
+- Si la conexión expira, desde BIG-IP Bash puede revisarse el tráfico con `tcpdump -nni 0.0 'host 10.1.3.4 and tcp port 8081'`. Para ingresar a Bash desde TMSH usa `run util bash`; sal con `exit`.
+
+### Los miembros permanecen Offline
+
+- Desde **BIG-IP TMSH**, ejecuta `run util bash -c "curl -I http://10.1.2.4/"` y `run util bash -c "curl -I http://10.1.2.5/"`. Deben responder normalmente `HTTP/1.1 200 OK`. Si HEAD no funciona, usa los comandos GET del Paso 2; un resultado HEAD distinto de 200 no demuestra por sí solo que el monitor HTTP GET esté fallando.
+- Examina `list ltm monitor http mon_http_lab04` y confirma la solicitud `GET /` y la cadena `recv`.
+- Si cambiaste el monitor a la ruta inexistente, **restaura `GET /`** antes de continuar.
+- Confirma que el monitor activo del pool sea el HTTP correcto, no uno dejado temporalmente en la prueba.
+
+### Los contadores no muestran exactamente 50/50 o 75/25
+
+- Registra **deltas** (valor después menos valor antes), porque las estadísticas pueden acumular actividad anterior.
+- Asegúrate de que los dos miembros estén disponibles y habilitados.
+- Los algoritmos distribuyen conexiones bajo condiciones específicas; no garantizan una secuencia idéntica de respuestas HTTP, especialmente con conexiones reutilizadas o actividad adicional.
+- Repite la medición con un número mayor de solicitudes nuevas si necesitas una tendencia más clara.
+
+### Una prueba de mantenimiento afecta la respuesta
+
+- Rehabilita inmediatamente el miembro desde TMUI.
+- Confirma que el monitor HTTP volvió a su configuración válida.
+- Comprueba los dos servicios (`8080` y `8081`). No cambies las Self IPs ni los objetos del laboratorio anterior como medida de recuperación.
+
+## Limpieza y estado final
+
+**No elimines los objetos al terminar.** Deja el entorno preparado para el siguiente laboratorio:
+
+- Servicio anterior `10.1.3.200:8080`: sin cambios.
+- Servicio nuevo `10.1.3.200:8081`: operativo.
+- `pool_lab04`: Round Robin, dos miembros habilitados, ratios `1:1`.
+- `mon_http_lab04`: envío `GET /`, recepción `200 OK`.
+- Configuración guardada con `save sys config`.
+
+No es necesario detener Apache, reiniciar BIG-IP, modificar ACLs, cambiar Port Lockdown ni entrar a Azure Portal.
+
+## Resumen técnico
+
+En esta práctica comprobaste que los objetos LTM pueden compartir servidores y, aun así, aplicar políticas diferentes a cada servicio. Un **monitor TCP** responde si se puede establecer una conexión, mientras que un **monitor HTTP** puede detectar un resultado de aplicación incorrecto. **Round Robin** tiende a repartir nuevas conexiones equitativamente y **Ratio (Member)** asigna pesos proporcionales. Finalmente, **Disabled** representa una decisión operativa deliberada y no debe confundirse con un fallo detectado por el monitor.
+
+## Referencias oficiales
+
+- [F5 — About Pools y métodos de balanceo](https://techdocs.f5.com/kb/en-us/products/big-ip_ltm/manuals/product/ltm-basics-11-6-0/4.html)
+- [F5 — Enabling and Disabling Local Traffic Objects](https://techdocs.f5.com/en-us/bigip-14-1-0/big-ip-local-traffic-management-basics-14-1-0/enabling-and-disabling-local-traffic-objects.html)
+- [F5 — Referencia de comandos TMSH](https://clouddocs.f5.com/cli/tmsh-reference/latest/)
 # Laboratorio 5 — Control avanzado de sesiones y aplicaciones: Persistence, TCP/HTTP Profiles, SSL, Priority Groups, iRules e identificación de objetos iApp
 
 ## Metadatos
 
 | Campo | Valor |
 |---|---|
-| **Duración** | 60 minutos |
-| **Complejidad** | Alta |
-| **Nivel Bloom** | Aplicar (Apply) |
-| **Versión BIG-IP** | F5 BIG-IP VE 17.1.2 |
-| **Alineación** | F5CAB3.01 – F5CAB3.02 |
+| Duración de la ruta principal | **60 minutos** |
+| Complejidad | Alta |
+| Nivel de Bloom | Aplicar y analizar |
+| Plataforma | BIG-IP VE en Azure, versión instalada verificable con `show sys version` |
+| Propósito | Administración LTM y preparación práctica para certificación F5 BIG-IP |
 
-## Descripción General
+## Descripción general
 
-Este laboratorio amplía la configuración del Virtual Server HTTP construido en los Laboratorios 1–4 incorporando control avanzado de sesiones y procesamiento de aplicaciones. El estudiante configurará Persistence Profiles (Cookie Insert y Source Address Affinity), optimizará el transporte con TCP y HTTP Profiles, habilitará HTTPS con certificados autofirmados mediante Client SSL y Server SSL Profiles, implementará Priority Groups para failover controlado entre Pool Members, creará una iRule condicional basada en cabeceras HTTP e identificará las dependencias y restricciones de objetos generados por una iApp de demostración. Al finalizar, el Virtual Server dispondrá de cifrado extremo a extremo, persistencia de sesión, distribución de carga priorizada y lógica personalizada de enrutamiento de tráfico.
+En este laboratorio administrarás sesiones de una aplicación ya publicada: comprobarás cuándo BIG-IP mantiene a un usuario en el mismo servidor, observarás cómo cambia las solicitudes HTTP, publicarás HTTPS mediante terminación TLS, ejecutarás una iRule y controlarás la selección de miembros mediante grupos de prioridad. No volverás a crear las VLANs ni las Self IPs de laboratorios anteriores. Configurarás objetos **nuevos, identificados con `lab05`**, para no modificar los servicios de los laboratorios 3 y 4.
 
-## Objetivos de Aprendizaje
+**Límite del ejercicio de 60 minutos:** se practica **Client SSL (cliente → BIG-IP)** con backend HTTP, no Server SSL. El cifrado hacia los dos servidores, y la creación de iApps, se presentan como ampliaciones independientes al final, porque implican cambios adicionales, validación de certificados y tiempo superior al disponible. No se considera cifrado de extremo a extremo cuando el tramo BIG-IP → backend utiliza HTTP.
 
-- [ ] Configurar y verificar Cookie Persistence y Source Address Affinity Persistence en un Virtual Server, demostrando la afinidad de sesión mediante inspección de cookies con `curl`.
-- [ ] Asignar TCP Profiles optimizados (client-side/server-side) y un HTTP Profile personalizado con X-Forwarded-For, validando la inserción de cabeceras en el backend.
-- [ ] Generar un certificado autofirmado con OpenSSL, crear Client SSL y Server SSL Profiles, y habilitar cifrado extremo a extremo entre cliente, BIG-IP y servidores backend.
-- [ ] Implementar Priority Groups en Pool Members con Priority Group Activation y verificar la promoción automática de miembros de menor prioridad ante la caída del grupo principal.
-- [ ] Crear una iRule que evalúe cabeceras HTTP para enrutamiento condicional, e identificar las dependencias y restricciones de modificación de objetos creados por una iApp.
+## Objetivos de aprendizaje
 
-## Prerrequisitos
+- Demostrar la diferencia entre Cookie Insert y Source Address Affinity mediante solicitudes reales y revisión de cabeceras.
+- Configurar un perfil HTTP que inserte `X-Forwarded-For` y verificar el encabezado en el tráfico hacia el backend.
+- Reconocer perfiles TCP de lado cliente y lado servidor y comprobar sus contextos sin cambiar la optimización de red innecesariamente.
+- Publicar una aplicación HTTPS con certificado autofirmado y Client SSL Profile, diferenciando terminación TLS y cifrado extremo a extremo.
+- Crear una iRule que inspeccione una cabecera HTTP y genere una respuesta especial bajo una condición concreta.
+- Configurar Priority Group Activation y comprobar la selección del servidor primario y su suplente con un cambio administrativo reversible.
+- Identificar qué son iApps y Strict Updates y localizar Application Services existentes, si las hay.
 
-### Conocimientos requeridos
+## Prerrequisitos y acceso
 
-- Comprensión de la relación jerárquica Node → Pool Member → Pool → Virtual Server según la Lección 3.1.
-- Conceptos fundamentales de TCP/IP, HTTP/1.1, HTTPS, handshake TLS y certificados X.509.
-- Familiaridad con cookies de sesión HTTP y su función en la persistencia de aplicaciones.
-- Navegación básica por TMUI y uso de TMSH adquiridos en los Laboratorios 1–4.
+- Laboratorios 1–4 completados; BIG-IP y los servidores HTTP deben estar operativos.
+- Acceso a **Windows personal** para TMUI o PuTTY y a **Ubuntu con escritorio** para Firefox y comandos `curl`.
+- **Dos terminales** durante las pruebas: una en Ubuntu Bash y otra en BIG-IP TMSH. Si una instrucción utiliza Bash en BIG-IP, se indicará expresamente.
+- Las contraseñas se obtienen del acceso asignado al pod; no se incluyen credenciales en esta guía.
+- Se requiere permiso para crear perfiles, pools, Virtual Servers, certificados e iRules en la partición `/Common`.
 
-### Acceso y estado requerido
+## Topología del pod Azure
 
-| Recurso | Detalle |
+```mermaid
+flowchart LR
+    PC["PC personal Windows<br/>TMUI/SSH públicos y escritorio remoto"]
+    AZ["Azure<br/>IP pública y DNAT de gestión"]
+    UB["Ubuntu cliente<br/>eth0: 10.1.1.246<br/>eth1: 10.1.3.4"]
+    BIG["F5 BIG-IP VE<br/>Management: 10.1.1.200<br/>External: 10.1.3.200<br/>Internal: 10.1.2.200"]
+    W1["Web01<br/>10.1.2.4:80"]
+    W2["Web02<br/>10.1.2.5:80"]
+    PC -->|"HTTPS / SSH públicos"| AZ
+    AZ -->|"Management"| BIG
+    PC -->|"Escritorio remoto"| UB
+    UB -.->|"Gestión privada 10.1.1.0/24"| BIG
+    UB -->|"External 10.1.3.0/24<br/>HTTP 8082 / HTTPS 8443"| BIG
+    BIG -->|"Internal 10.1.2.0/24<br/>HTTP 80"| W1
+    BIG -->|"Internal 10.1.2.0/24<br/>HTTP 80"| W2
+```
+
+| Recurso | Dirección / uso |
 |---|---|
-| Virtual Server `vs_http_lab` | IP `10.10.10.100:80`, estado Available, creado en laboratorios anteriores |
-| Pool `pool_webapp` | Miembros `10.20.20.11:80` y `10.20.20.12:80`, ambos Available |
-| Health Monitor `monitor_http_lab` | Asociado a `pool_webapp`, verificando respuesta HTTP |
-| BIG-IP Management | SSH y TMUI en `192.0.2.245` desde `192.0.2.10` — credenciales `admin` / `F5lab2024!` |
-| Cliente de pruebas | IP `10.10.10.10/24`, con `curl` 8.5.0 y Firefox ESR 128.0 |
-| Servidores backend | `web01` (`10.20.20.11`) y `web02` (`10.20.20.12`) con Apache 2.4.58 en puerto 80 |
-| OpenSSL | Versión 3.0.2 disponible en el cliente o en los servidores backend (Ubuntu 22.04.4 LTS) |
+| BIG-IP Management | `10.1.1.200`, administración; no modificar |
+| BIG-IP External Self IP | `10.1.3.200`, interfaz de entrada del cliente |
+| BIG-IP Internal Self IP | `10.1.2.200`, tráfico hacia servidores y SNAT AutoMap |
+| Ubuntu cliente | `10.1.3.4` en la red External; `10.1.1.246` para administración |
+| Web01 / Web02 | `10.1.2.4:80` / `10.1.2.5:80` |
+| Servicio HTTP Lab 05 | `10.1.3.200:8082` |
+| Servicio HTTPS Lab 05 | `10.1.3.200:8443` |
 
-> **Nota sobre versiones:** La especificación del laboratorio menciona OpenSSL 3.3.0 y Apache 2.4.59; sin embargo, el entorno real del curso utiliza **OpenSSL 3.0.2** (incluido en Ubuntu 22.04.4 LTS) y **Apache 2.4.58**. Los procedimientos de este laboratorio están validados para estas versiones del entorno. Igualmente, la versión de BIG-IP del entorno es **17.1.2**, no 17.1.1.3.
+> **Importante:** los puertos 8082 y 8443 son puertos de **Virtual Servers**, no cambios a la Self IP, ni al servicio TMUI. No modificar Port Lockdown, Management IP, Self IPs ni las reglas de Azure. Una VIP puede utilizar la dirección de una Self IP con un puerto específico; los servicios administrativos en otros puertos permanecen independientes. Si cualquiera de estos puertos ya está ocupado, no sobrescribas el objeto: revisa `list ltm virtual` y elige un puerto libre con el responsable del entorno.
 
-## Entorno de Laboratorio
+## Distribución del tiempo
 
-### Topología de red
+| Actividad | Duración |
+|---|---:|
+| 0. Preflight y servicio HTTP aislado | 8 min |
+| 1. Cookie Persistence y Source Address Affinity | 14 min |
+| 2. HTTP Profile, X-Forwarded-For y TCP Profiles | 9 min |
+| 3. Certificado, Client SSL y Virtual Server HTTPS | 15 min |
+| 4. iRule condicional y pruebas | 7 min |
+| 5. Priority Group Activation y recuperación | 5 min |
+| 6. Network Map, validación y guardado | 2 min |
+| **Total** | **60 min** |
 
-```
-┌──────────────┐     VLAN External      ┌──────────────┐     VLAN Internal     ┌──────────────┐
-│   Cliente     │     10.10.10.0/24      │   BIG-IP VE  │     10.20.20.0/24     │   web01      │
-│ 10.10.10.10   ├────────────────────────┤ ext: .245    ├───────────────────────┤ 10.20.20.11  │
-│               │                        │ int: .245    │                       │  Apache:80   │
-└──────────────┘                         │ mgmt: 192.0. │                       └──────────────┘
-                                         │  2.245       │                       ┌──────────────┐
-┌──────────────┐     VLAN Management     │              │                       │   web02      │
-│ Admin Client  ├────────────────────────┤              ├───────────────────────┤ 10.20.20.12  │
-│ 192.0.2.10    │     192.0.2.0/24       └──────────────┘                       │  Apache:80   │
-└──────────────┘                                                                └──────────────┘
-```
+## Paso 0. Comprobación inicial y creación de un servicio independiente (8 min)
 
-### Direcciones clave
+**Objetivo.** Crear el punto de partida sin alterar los servicios de los laboratorios anteriores.
 
-| Objeto | Dirección |
-|---|---|
-| Virtual Server HTTP | `10.10.10.100:80` |
-| Virtual Server HTTPS (a crear) | `10.10.10.101:443` |
-| BIG-IP external Self IP | `10.10.10.245/24` |
-| BIG-IP internal Self IP | `10.20.20.245/24` |
-| web01 | `10.20.20.11:80` (y `:443` tras configuración SSL backend) |
-| web02 | `10.20.20.12:80` (y `:443` tras configuración SSL backend) |
+1. Entra a TMUI desde Firefox de Ubuntu: `https://10.1.1.200`. Si administras desde Windows, utiliza la IP pública que corresponda a tu pod.
+2. Desde **BIG-IP TMSH** (al conectarte por SSH ya estás en el indicador `(tmos)#`), ejecuta:
 
-### Verificación previa del entorno
+   ```text
+   show sys version
+   list net self External-IP
+   list net self Internal-IP
+   list ltm virtual
+   ```
 
-Desde el cliente de pruebas (`10.10.10.10`), confirmar que el Virtual Server HTTP responde:
+   Confirma las direcciones de las Self IPs; el nombre mostrado puede ser diferente y debe prevalecer el que existe en tu equipo. Identifica los Virtual Servers existentes. **No edites** los servicios `:8080` y `:8081`.
 
-```bash
-curl -s -o /dev/null -w "%{http_code}" http://10.10.10.100
-```
+3. En **Ubuntu Bash** verifica ambos backends desde la red que los alcance. Para probarlos desde BIG-IP, utiliza **TMSH**:
 
-**Salida esperada:** `200`
+   ```text
+   run util bash -c "curl -I --connect-timeout 5 http://10.1.2.4/"
+   run util bash -c "curl -I --connect-timeout 5 http://10.1.2.5/"
+   ```
 
-Desde TMSH en BIG-IP, confirmar el estado del pool:
+   Ambos deben devolver una respuesta HTTP, normalmente `HTTP/1.1 200 OK`. Una respuesta distinta de 200 debe investigarse antes de configurar el pool.
 
-```bash
-tmsh show ltm pool pool_webapp members
-```
+4. En TMUI ve a **Local Traffic → Pools → Pool List → Create**. Configura:
 
-**Salida esperada:** Ambos miembros con estado `available` y `State: up`.
+   | Campo visible | Valor |
+   |---|---|
+   | Name | `pool_lab05` |
+   | Health Monitors | `http` (mover de Available a Active) |
+   | Load Balancing Method | `Round Robin` |
+   | New Members | `10.1.2.4` puerto `80` y `10.1.2.5` puerto `80`, uno a uno con **Add** |
 
-## Instrucciones Paso a Paso
+   Pulsa **Finished**. En **Local Traffic → Pools → Pool List → pool_lab05 → Members**, comprueba que ambos aparecen verdes. Si todavía no lo están, espera los ciclos del monitor y consulta la solución de problemas.
 
-### Paso 1: Configurar Cookie Persistence Profile y verificar afinidad de sesión
-
-**Objetivo:** Crear un Cookie Persistence Profile de tipo HTTP Cookie Insert, asociarlo al Virtual Server HTTP y demostrar que las solicitudes subsiguientes del mismo cliente se dirigen al mismo Pool Member.
-
-**Instrucciones:**
-
-1. Acceder a TMUI en `https://192.0.2.245` con las credenciales `admin` / `F5lab2024!`.
-
-2. Crear el Cookie Persistence Profile. Navegar a **Local Traffic → Profiles → Persistence** y hacer clic en **Create**.
+5. Ve a **Local Traffic → Virtual Servers → Virtual Server List → Create**. Configura:
 
    | Campo | Valor |
    |---|---|
-   | Name | `persist_cookie_lab` |
+   | Name | `vs_lab05_http` |
+   | Type | `Standard` |
+   | Destination Address/Mask | `10.1.3.200` con máscara de host `/32` cuando se solicite |
+   | Service Port | `8082` |
+   | Protocol | `TCP` |
+   | HTTP Profile (Client) | `http` |
+   | Source Address Translation | `Auto Map` |
+   | Default Pool / Resources | `pool_lab05` |
+
+   Cambia **Configuration** a **Advanced** cuando un campo no aparezca. Selecciona **Finished**. El perfil TCP predeterminado puede ser `tcp`; no hace falta sustituirlo todavía.
+
+6. En **Ubuntu Bash**, genera cuatro conexiones nuevas:
+
+   ```bash
+   for i in $(seq 1 4); do curl -sS --connect-timeout 5 -H 'Connection: close' http://10.1.3.200:8082/; echo; done
+   ```
+
+   **Resultado esperado:** respuestas de ambos servidores, identificables por el contenido de sus páginas. Si ambas páginas son iguales, la comprobación fiable está en las estadísticas de `pool_lab05`; no supongas alternancia leyendo páginas idénticas.
+
+7. En **BIG-IP TMSH**:
+
+   ```text
+   show ltm pool pool_lab05 members
+   show ltm virtual vs_lab05_http
+   ```
+
+   **Criterio de avance:** pool y Virtual Server disponibles, y tráfico HTTP funcional desde Ubuntu.
+
+## Paso 1. Cookie Persistence frente a Source Address Affinity (14 min)
+
+**Problema que resuelve.** Un usuario con una aplicación con estado (por ejemplo, carrito o sesión local) puede perder contexto si pasa de Web01 a Web02. La persistencia fija la selección de backend según una clave, pero las claves no son equivalentes.
+
+### 1.1 Cookie Insert: el cliente conserva una cookie
+
+1. En TMUI: **Local Traffic → Profiles → Persistence → Create**.
+2. Configura:
+
+   | Campo | Valor |
+   |---|---|
+   | Name | `persist_cookie_lab05` |
    | Persistence Type | `Cookie` |
+   | Parent Profile | `cookie` (si se solicita) |
    | Cookie Method | `HTTP Cookie Insert` |
-   | Timeout | `300` (segundos) |
 
-   Hacer clic en **Finished**.
+   Conserva los demás valores predeterminados y pulsa **Finished**. La duración de la cookie depende del perfil; no confundas expiración de cookie con timeout de la tabla de persistencia.
 
-3. Alternativamente, crear el perfil mediante TMSH:
-
-   ```bash
-   tmsh create ltm persistence cookie persist_cookie_lab \
-       method insert \
-       timeout 300
-   ```
-
-4. Asociar el perfil al Virtual Server. Navegar a **Local Traffic → Virtual Servers → vs_http_lab → Resources**. En el campo **Default Persistence Profile**, seleccionar `persist_cookie_lab`. Hacer clic en **Update**.
-
-   Equivalente TMSH:
+3. Abre **Local Traffic → Virtual Servers → Virtual Server List → vs_lab05_http → Resources**. En **Default Persistence Profile** selecciona `persist_cookie_lab05` y pulsa **Update**.
+4. Desde **Ubuntu Bash**, crea un archivo de cookies nuevo y prueba:
 
    ```bash
-   tmsh modify ltm virtual vs_http_lab persist replace-all-with { persist_cookie_lab }
+   rm -f /tmp/lab05_cookies.txt
+   curl -sS -D /tmp/lab05_headers.txt -c /tmp/lab05_cookies.txt http://10.1.3.200:8082/
+   grep -i '^Set-Cookie:' /tmp/lab05_headers.txt
+   cat /tmp/lab05_cookies.txt
+   for i in $(seq 1 5); do curl -sS -b /tmp/lab05_cookies.txt -c /tmp/lab05_cookies.txt -H 'Connection: close' http://10.1.3.200:8082/; echo; done
    ```
 
-5. Desde el cliente de pruebas, ejecutar una primera solicitud con `curl` mostrando las cabeceras de respuesta:
+   **Resultado esperado:** `Set-Cookie` emitido por BIG-IP (normalmente con prefijo `BIGipServer`) y cinco respuestas del **mismo** backend. Si la página no identifica al servidor, consulta la estadística por miembro o añade una identificación visible en las páginas existentes como parte de la preparación del entorno.
 
-   ```bash
-   curl -v http://10.10.10.100/ 2>&1 | grep -i "set-cookie\|server"
+5. En **BIG-IP TMSH**, verifica el perfil asociado:
+
+   ```text
+   list ltm virtual vs_lab05_http persist
    ```
 
-6. Observar la cookie `BIGipServerpool_webapp` en la cabecera `Set-Cookie`. Copiar el valor completo de la cookie.
+### 1.2 Source Address Affinity: no necesita cookie HTTP
 
-7. Ejecutar solicitudes subsiguientes enviando la cookie recibida para verificar persistencia:
-
-   ```bash
-   COOKIE="BIGipServerpool_webapp=<valor_obtenido>"
-   for i in $(seq 1 5); do
-       curl -s -b "$COOKIE" http://10.10.10.100/ | grep -o "web0[12]"
-   done
-   ```
-
-   Sustituir `<valor_obtenido>` por el valor real de la cookie del paso 6.
-
-8. Verificar que las 5 solicitudes se dirigen al mismo servidor backend.
-
-**Salida esperada:**
-
-```
-web01
-web01
-web01
-web01
-web01
-```
-
-(O `web02` en las 5 líneas, dependiendo del miembro seleccionado inicialmente.)
-
-**Verificación:**
-
-```bash
-tmsh show ltm persistence persist-records all-properties
-```
-
-Confirmar que existe al menos un registro de persistencia asociado a `pool_webapp` con el tipo `cookie`.
-
----
-
-### Paso 2: Configurar Source Address Affinity Persistence y comparar comportamiento
-
-**Objetivo:** Crear un Source Address Affinity Persistence Profile, sustituirlo en el Virtual Server y comparar el mecanismo de afinidad con el Cookie Persistence.
-
-**Instrucciones:**
-
-1. Crear el Source Address Affinity Profile. En TMUI, navegar a **Local Traffic → Profiles → Persistence → Create**:
+1. En TMUI: **Local Traffic → Profiles → Persistence → Create**.
+2. Configura:
 
    | Campo | Valor |
    |---|---|
-   | Name | `persist_srcaddr_lab` |
+   | Name | `persist_source_lab05` |
    | Persistence Type | `Source Address Affinity` |
-   | Timeout | `180` (segundos) |
+   | Parent Profile | `source_addr` (si aparece) |
+   | Timeout | `180` (si está disponible) |
    | Mask | `255.255.255.255` |
 
-   Hacer clic en **Finished**.
-
-   Equivalente TMSH:
-
-   ```bash
-   tmsh create ltm persistence source-addr persist_srcaddr_lab \
-       timeout 180 \
-       mask 255.255.255.255
-   ```
-
-2. Cambiar el perfil de persistencia del Virtual Server:
+   Pulsa **Finished**.
+3. Regresa a **Local Traffic → Virtual Servers → Virtual Server List → vs_lab05_http → Resources**. Cambia **Default Persistence Profile** a `persist_source_lab05` y pulsa **Update**.
+4. Desde **Ubuntu Bash** ejecuta sin cookies:
 
    ```bash
-   tmsh modify ltm virtual vs_http_lab persist replace-all-with { persist_srcaddr_lab }
+   for i in $(seq 1 5); do curl -sS -H 'Connection: close' http://10.1.3.200:8082/; echo; done
+   curl -sS -D - -o /dev/null http://10.1.3.200:8082/ | grep -i '^Set-Cookie:'
    ```
 
-3. Limpiar los registros de persistencia anteriores:
+   **Resultado esperado:** se repite el mismo miembro para solicitudes desde `10.1.3.4`, **sin** cookie de persistencia insertada por BIG-IP. Una respuesta sin `Set-Cookie` no excluye que la propia aplicación pueda generar otras cookies.
+5. En **BIG-IP TMSH**:
 
-   ```bash
-   tmsh delete ltm persistence persist-records all
+   ```text
+   list ltm virtual vs_lab05_http persist
+   show ltm persistence persist-records
    ```
 
-4. Desde el cliente, ejecutar 5 solicitudes sin enviar cookies:
+   La tabla suele mostrar registros de Source Address Affinity. Cookie Insert no necesita necesariamente un registro equivalente en esa tabla: la cookie es la evidencia principal.
 
-   ```bash
-   for i in $(seq 1 5); do
-       curl -s http://10.10.10.100/ | grep -o "web0[12]"
-   done
-   ```
+6. Vuelve a **Resources**, restaura **Default Persistence Profile = `persist_cookie_lab05`** y pulsa **Update**.
 
-5. Verificar que todas las solicitudes se dirigen al mismo miembro (afinidad por IP de origen).
+**Análisis:** ¿qué sucede si varios usuarios salen por una misma IP NAT? Source Address Affinity puede hacer que todos compartan el mismo backend; Cookie Insert diferencia navegadores mediante sus cookies.
 
-6. Inspeccionar las cabeceras de respuesta y confirmar que **no** se envía cookie `BIGipServer`:
+## Paso 2. TCP/HTTP Profiles y X-Forwarded-For (9 min)
 
-   ```bash
-   curl -v http://10.10.10.100/ 2>&1 | grep -i "set-cookie"
-   ```
+**Problema que resuelve.** Con SNAT AutoMap, Apache observa normalmente `10.1.2.200` como dirección IP de origen; para que la aplicación conozca el cliente original, BIG-IP puede insertar `X-Forwarded-For` en la petición HTTP.
 
-   **Salida esperada:** Sin líneas `Set-Cookie` de BIG-IP.
-
-7. Verificar el registro de persistencia:
-
-   ```bash
-   tmsh show ltm persistence persist-records
-   ```
-
-   **Salida esperada:** Registro con la IP de origen `10.10.10.10` asociada a un Pool Member específico.
-
-**Verificación:**
-
-Documentar la diferencia observada: Cookie Persistence utiliza una cookie HTTP insertada por BIG-IP (visible en cabeceras), mientras que Source Address Affinity no modifica las cabeceras HTTP y persiste basándose en la dirección IP del cliente.
-
-8. **Restaurar Cookie Persistence** para los pasos siguientes:
-
-   ```bash
-   tmsh modify ltm virtual vs_http_lab persist replace-all-with { persist_cookie_lab }
-   ```
-
----
-
-### Paso 3: Asignar TCP Profiles optimizados y HTTP Profile con X-Forwarded-For
-
-**Objetivo:** Configurar perfiles TCP diferenciados para el lado cliente y servidor, y un HTTP Profile que inserte la cabecera `X-Forwarded-For` y elimine la cabecera `Server` de las respuestas.
-
-**Instrucciones:**
-
-1. Asignar los TCP Profiles al Virtual Server. Navegar a **Local Traffic → Virtual Servers → vs_http_lab → Properties** (pestaña **Advanced**).
-
-   En la sección **Configuration: Advanced**:
-   - **Protocol Profile (Client):** `tcp-wan-optimized`
-   - **Protocol Profile (Server):** `tcp-lan-optimized`
-
-   Hacer clic en **Update**.
-
-   Equivalente TMSH:
-
-   ```bash
-   tmsh modify ltm virtual vs_http_lab \
-       profiles replace-all-with { tcp-wan-optimized { context clientside } tcp-lan-optimized { context serverside } http }
-   ```
-
-2. Crear un HTTP Profile personalizado. Navegar a **Local Traffic → Profiles → Services → HTTP → Create**:
+1. En TMUI: **Local Traffic → Profiles → Services → HTTP → Create**.
+2. Configura:
 
    | Campo | Valor |
    |---|---|
-   | Name | `http_lab_custom` |
+   | Name | `http_lab05_xff` |
    | Parent Profile | `http` |
-   | Insert X-Forwarded-For | `Enabled` (marcar la casilla de override y activar) |
-   | Server Agent Name | (dejar vacío y marcar **Erase** en Server Header) |
+   | Insert X-Forwarded-For | habilita la casilla de modificación/override y selecciona `Enabled` |
 
-   > **Nota:** En BIG-IP 17.1.2, la opción para eliminar la cabecera Server se encuentra en el campo **Server Agent Name**. Establecerlo vacío con la opción de reescritura habilitada elimina la cabecera Server de las respuestas.
+   Pulsa **Finished**. **No** intentes eliminar la cabecera `Server` mediante un campo ambiguo: ese objetivo no es necesario para demostrar XFF.
+3. En **Local Traffic → Virtual Servers → Virtual Server List → vs_lab05_http → Properties**, selecciona **Configuration: Advanced**. Cambia **HTTP Profile (Client)** a `http_lab05_xff` y pulsa **Update**.
+4. En la misma pantalla, localiza **Protocol Profile (Client)** y **Protocol Profile (Server)**. Examina sus valores; comprueba desde **BIG-IP TMSH**:
 
-   Hacer clic en **Finished**.
+   ```text
+   list ltm virtual vs_lab05_http profiles
+   list ltm profile http http_lab05_xff
+   ```
 
-   Equivalente TMSH:
+   **Concepto:** el perfil TCP puede tener contexto `clientside` o `serverside`. En esta práctica conservamos los perfiles TCP actuales porque no se ha medido latencia o pérdida que justifique cambiarlos.
+5. **Comprobar X-Forwarded-For sin acceder a Web01 ni Web02.** Abre una segunda sesión SSH a BIG-IP; desde el indicador `(tmos)#`, entra en **Bash de BIG-IP**:
+
+   ```text
+   run util bash
+   ```
+
+   Ejecuta esta captura filtrada y **déjala abierta**:
 
    ```bash
-   tmsh create ltm profile http http_lab_custom \
-       defaults-from http \
-       insert-xforwarded-for enabled \
-       server-agent-name none
+   tcpdump -l -nni 0.0 -s 0 -A \
+     'src host 10.1.2.200 and dst port 80' \
+     | grep --line-buffered -A 15 'verificar_xff=999'
    ```
 
-3. Asociar el HTTP Profile personalizado al Virtual Server:
+   **Qué hace el filtro:** `tcpdump` observa las solicitudes que salen de BIG-IP hacia Apache, y `grep` muestra únicamente el fragmento donde aparece nuestra URL de prueba, junto con las líneas siguientes de sus cabeceras HTTP. Los Health Monitors siguen generando tráfico, pero su salida queda oculta porque no incluyen `verificar_xff=999`. Este filtrado **no elimina paquetes de la captura**; filtra el texto mostrado. No añadas `-c 40`: la captura podría terminar antes de que se genere la solicitud.
+
+6. En **Ubuntu Bash**, desde una segunda terminal, ejecuta:
 
    ```bash
-   tmsh modify ltm virtual vs_http_lab \
-       profiles replace-all-with { tcp-wan-optimized { context clientside } tcp-lan-optimized { context serverside } http_lab_custom }
+   curl --noproxy '*' -sS \
+     'http://10.1.3.200:8082/?verificar_xff=999'
    ```
 
-4. Verificar la configuración aplicada:
+   La respuesta debe contener el contenido de Web01 o Web02. **Vuelve a la terminal de captura** y localiza un bloque parecido al siguiente (el orden y la cantidad de cabeceras pueden variar):
 
-   ```bash
-   tmsh list ltm virtual vs_http_lab profiles
+   ```http
+   GET /?verificar_xff=999 HTTP/1.1
+   Host: 10.1.3.200:8082
+   X-Forwarded-For: 10.1.3.4
    ```
 
-   **Salida esperada:**
+   **Interpretación:** `src host 10.1.2.200` confirma el origen TCP traducido mediante SNAT AutoMap; `X-Forwarded-For: 10.1.3.4` demuestra que BIG-IP **envía hacia Apache** la IP original del cliente dentro de HTTP. La prueba no demuestra que Apache guarde esa cabecera en sus registros, porque no se tiene acceso a los servidores.
 
-   ```
-   ltm virtual vs_http_lab {
-       profiles {
-           http_lab_custom {
-               context all
-           }
-           tcp-lan-optimized {
-               context serverside
-           }
-           tcp-wan-optimized {
-               context clientside
-           }
-       }
-   }
+7. Detén `tcpdump` con `Ctrl+C` y escribe `exit` para regresar de Bash a TMSH. Si la salida no aparece, comprueba primero los nombres y propiedades reales:
+
+   ```text
+   list ltm virtual vs_lab05_http profiles
+   list ltm profile http http_lab05_xff insert-xforwarded-for
    ```
 
-5. Verificar la inserción de `X-Forwarded-For` en el backend. Primero, habilitar temporalmente el log de cabeceras en uno de los servidores web. En `web01` (`10.20.20.11`), via SSH:
+   El perfil `http_lab05_xff` debe aparecer en el Virtual Server y mostrar `insert-xforwarded-for enabled`. Comprueba también que `curl` está utilizando exactamente `10.1.3.200:8082`, no los puertos de los laboratorios anteriores. Si necesitas repetir la prueba, reinicia la captura antes de lanzar `curl`.
 
-   ```bash
-   # En web01, crear un script CGI de diagnóstico
-   sudo bash -c 'cat > /var/www/html/headers.sh << "SCRIPT"
-   #!/bin/bash
-   echo "Content-Type: text/plain"
-   echo ""
-   env | grep HTTP_ | sort
-   SCRIPT'
-   sudo chmod +x /var/www/html/headers.sh
-   sudo a2enmod cgid
-   sudo systemctl restart apache2
-   ```
+**Resultado esperado:** la respuesta HTTP llega desde uno de los backends; en el tráfico saliente BIG-IP → Apache se observa `X-Forwarded-For: 10.1.3.4` aunque el origen de la conexión TCP es `10.1.2.200`.
 
-   Alternativamente, si CGI no está disponible, inspeccionar el log de acceso de Apache:
+**Advertencia:** XFF es un encabezado HTTP, no un reemplazo de la IP origen a nivel 3. En producción se debe definir qué proxies son confiables y cómo tratar cabeceras XFF preexistentes.
 
-   ```bash
-   # En web01, modificar el formato de log para incluir X-Forwarded-For
-   sudo bash -c 'echo "LogFormat \"%h %l %u %t \\\"%r\\\" %>s %b \\\"%{X-Forwarded-For}i\\\"\" xfflog" >> /etc/apache2/apache2.conf'
-   sudo bash -c 'echo "CustomLog /var/log/apache2/xff_access.log xfflog" >> /etc/apache2/sites-enabled/000-default.conf'
-   sudo systemctl reload apache2
-   ```
+## Paso 3. HTTPS con Client SSL: terminación TLS en BIG-IP (15 min)
 
-6. Desde el cliente, enviar una solicitud:
+**Problema que resuelve.** Los clientes requieren cifrar sus conexiones HTTP al acceder a una aplicación. BIG-IP puede terminar TLS y reenviar HTTP a un backend, inspeccionando y aplicando políticas al contenido descifrado.
 
-   ```bash
-   curl -s http://10.10.10.100/
-   ```
+### 3.1 Crear un certificado autofirmado dentro de BIG-IP
 
-7. En `web01`, verificar el log:
-
-   ```bash
-   tail -1 /var/log/apache2/xff_access.log
-   ```
-
-   **Salida esperada:** Una línea que contenga `"10.10.10.10"` como valor de X-Forwarded-For.
-
-8. Verificar que la cabecera `Server` ha sido eliminada de la respuesta:
-
-   ```bash
-   curl -sI http://10.10.10.100/ | grep -i "^server:"
-   ```
-
-   **Salida esperada:** Sin salida (la cabecera Server no aparece o muestra un valor vacío).
-
-**Verificación:**
-
-```bash
-tmsh show ltm virtual vs_http_lab
-```
-
-Confirmar que los perfiles `tcp-wan-optimized`, `tcp-lan-optimized` y `http_lab_custom` aparecen en la configuración del Virtual Server.
-
----
-
-### Paso 4: Generar certificado autofirmado y configurar Client SSL Profile para HTTPS
-
-**Objetivo:** Crear un certificado autofirmado con OpenSSL, importarlo al BIG-IP, configurar un Client SSL Profile y habilitar un Virtual Server HTTPS en `10.10.10.101:443`.
-
-**Instrucciones:**
-
-1. Desde el cliente de administración (`192.0.2.10`) o directamente en el BIG-IP vía SSH, generar la clave privada y el certificado autofirmado:
-
-   ```bash
-   openssl req -x509 -newkey rsa:2048 -keyout lab_f5curso.key -out lab_f5curso.crt \
-       -sha256 -days 365 -nodes \
-       -subj "/C=MX/ST=Lab/L=Lab/O=F5Curso/CN=lab.f5curso.local"
-   ```
-
-   > **Nota:** Se utiliza OpenSSL 3.0.2 (versión incluida en Ubuntu 22.04.4 LTS). Verificar la versión con `openssl version`.
-
-2. Verificar el certificado generado:
-
-   ```bash
-   openssl x509 -in lab_f5curso.crt -noout -subject -dates
-   ```
-
-   **Salida esperada:**
-
-   ```
-   subject=C = MX, ST = Lab, L = Lab, O = F5Curso, CN = lab.f5curso.local
-   notBefore=<fecha_actual>
-   notAfter=<fecha_actual + 365 días>
-   ```
-
-3. Importar el certificado y la clave al BIG-IP mediante TMUI. Navegar a **System → Certificate Management → Traffic Certificate Management → SSL Certificate List → Import**.
-
-   - **Import Type:** `Certificate`
-   - **Certificate Name:** `lab_f5curso_cert`
-   - **Certificate Source:** Pegar el contenido de `lab_f5curso.crt` o subir el archivo.
-   - Hacer clic en **Import**.
-
-   Repetir para la clave:
-   - **Import Type:** `Key`
-   - **Key Name:** `lab_f5curso_key`
-   - **Key Source:** Pegar el contenido de `lab_f5curso.key` o subir el archivo.
-   - Hacer clic en **Import**.
-
-   Equivalente TMSH (si los archivos están en el BIG-IP en `/var/tmp/`):
-
-   ```bash
-   tmsh install sys crypto cert lab_f5curso_cert from-local-file /var/tmp/lab_f5curso.crt
-   tmsh install sys crypto key lab_f5curso_key from-local-file /var/tmp/lab_f5curso.key
-   ```
-
-4. Crear el Client SSL Profile. Navegar a **Local Traffic → Profiles → SSL → Client → Create**:
+1. En TMUI: **System → Certificate Management → Traffic Certificate Management → SSL Certificate List → Create**.
+2. Rellena:
 
    | Campo | Valor |
    |---|---|
-   | Name | `clientssl_lab` |
-   | Parent Profile | `clientssl` |
-   | Certificate Key Chain | Agregar: Certificate = `lab_f5curso_cert`, Key = `lab_f5curso_key` |
+   | Name | `lab05_cert` |
+   | Issuer | `Self` |
+   | Common Name | `lab05.local` |
+   | Lifetime | `365` días |
+   | Subject Alternative Name | `DNS:lab05.local`, si la pantalla admite esta sintaxis |
+   | Key Type | RSA, si se solicita |
+   | Key Size | 2048 bits o superior, si se solicita |
 
-   Hacer clic en **Finished**.
+   Mantén los campos no pertinentes en sus valores predeterminados y pulsa **Finished**. Al emitirlo el propio BIG-IP, se crea la clave privada asociada: **no hay que importar una clave separada**.
+3. Comprueba que `lab05_cert` existe en **SSL Certificate List**. Si no aparece la opción de autofirmar, detén la configuración TLS y revisa el método permitido por la versión; no utilices certificados de administración existentes como sustituto sin autorización.
 
-   Equivalente TMSH:
+### 3.2 Crear Client SSL Profile
 
-   ```bash
-   tmsh create ltm profile client-ssl clientssl_lab \
-       cert-key-chain add { default { cert lab_f5curso_cert key lab_f5curso_key } }
+1. En TMUI: **Local Traffic → Profiles → SSL → Client → Create**.
+2. Configura **Name = `clientssl_lab05`**, **Parent Profile = `clientssl`**.
+3. En **Certificate Key Chain** (puede requerir activar el override), selecciona **Add**, elige el certificado `lab05_cert` y su clave asociada `lab05_cert`, y guarda la entrada con **Add**/**Finished** según la ventana. Asegúrate de no dejar únicamente el certificado de ejemplo predeterminado.
+4. Pulsa **Finished** y comprueba desde **BIG-IP TMSH**:
+
+   ```text
+   list ltm profile client-ssl clientssl_lab05 cert-key-chain
    ```
 
-5. Crear el Virtual Server HTTPS. Navegar a **Local Traffic → Virtual Servers → Create**:
+### 3.3 Publicar un HTTPS independiente
+
+1. Ve a **Local Traffic → Virtual Servers → Virtual Server List → Create** y configura:
 
    | Campo | Valor |
    |---|---|
-   | Name | `vs_https_lab` |
+   | Name | `vs_lab05_https` |
    | Type | `Standard` |
-   | Destination Address/Mask | `10.10.10.101` |
-   | Service Port | `443` |
+   | Destination Address/Mask | `10.1.3.200` / `/32` |
+   | Service Port | `8443` |
    | Protocol | `TCP` |
-   | Protocol Profile (Client) | `tcp-wan-optimized` |
-   | Protocol Profile (Server) | `tcp-lan-optimized` |
-   | HTTP Profile | `http_lab_custom` |
-   | SSL Profile (Client) | `clientssl_lab` |
+   | HTTP Profile (Client) | `http_lab05_xff` |
+   | SSL Profile (Client) | `clientssl_lab05` |
    | Source Address Translation | `Auto Map` |
-   | Default Pool | `pool_webapp` |
-   | Default Persistence Profile | `persist_cookie_lab` |
+   | Default Pool | `pool_lab05` |
+   | Default Persistence Profile | `None` por ahora: facilita los experimentos de prioridad |
 
-   Hacer clic en **Finished**.
-
-   Equivalente TMSH:
-
-   ```bash
-   tmsh create ltm virtual vs_https_lab \
-       destination 10.10.10.101:443 \
-       ip-protocol tcp \
-       profiles replace-all-with { tcp-wan-optimized { context clientside } tcp-lan-optimized { context serverside } http_lab_custom clientssl_lab } \
-       source-address-translation { type automap } \
-       pool pool_webapp \
-       persist replace-all-with { persist_cookie_lab }
-   ```
-
-6. Verificar el estado del nuevo Virtual Server:
+   Selecciona **Configuration: Advanced** para encontrar los perfiles, si corresponde. Al terminar pulsa **Finished**.
+2. Desde **Ubuntu Bash**:
 
    ```bash
-   tmsh show ltm virtual vs_https_lab
+   curl -vk --connect-timeout 5 https://10.1.3.200:8443/
    ```
 
-   **Salida esperada:** Estado `available` con la dirección de destino `10.10.10.101:443`.
+   Debe completarse el handshake TLS y mostrarse una respuesta del backend, normalmente HTTP 200. `-k` permite la prueba con certificado autofirmado, **sin verificar la cadena de confianza**.
+3. En **BIG-IP TMSH**:
 
-7. Desde el cliente, probar el acceso HTTPS con `curl`:
-
-   ```bash
-   curl -k -v https://10.10.10.101/ 2>&1 | head -30
+   ```text
+   show ltm virtual vs_lab05_https
+   list ltm virtual vs_lab05_https profiles
    ```
 
-   **Salida esperada:** Handshake TLS exitoso con el certificado `CN=lab.f5curso.local`, seguido de la respuesta HTTP 200 del backend.
+4. Compara los dos tramos:
 
-8. Desde Firefox ESR 128.0 en el cliente, acceder a `https://10.10.10.101/`. Aceptar la advertencia de certificado autofirmado. Verificar que la página del backend se muestra correctamente. Inspeccionar el certificado haciendo clic en el icono de candado para confirmar que el CN es `lab.f5curso.local`.
+   | Tramo | Protocolo | ¿Cifrado? |
+   |---|---|---|
+   | Ubuntu `10.1.3.4` → BIG-IP `10.1.3.200:8443` | HTTPS/TLS | Sí |
+   | BIG-IP `10.1.2.200` → Web01/Web02 `:80` | HTTP | No |
 
-**Verificación:**
+**Conclusión:** este escenario representa **SSL offloading**. Para cifrado también hacia Apache hacen falta HTTPS en los servidores, un pool `:443`, un Server SSL Profile y validación del certificado backend. Es una ampliación, no una propiedad ya conseguida en este paso.
 
-```bash
-tmsh list ltm profile client-ssl clientssl_lab cert-key-chain
-```
+## Paso 4. Crear una iRule para inspeccionar HTTP (7 min)
 
-Confirmar que el perfil referencia `lab_f5curso_cert` y `lab_f5curso_key`.
+**Problema que resuelve.** BIG-IP puede tomar decisiones en función de encabezados HTTP una vez terminada la sesión TLS y procesada la petición. Se demostrará una respuesta directa, **no un cambio de ruta hacia un pool alternativo**.
 
----
-
-### Paso 5: Configurar Server SSL Profile para cifrado extremo a extremo
-
-**Objetivo:** Habilitar HTTPS en los servidores backend, crear un Server SSL Profile y asociarlo al Virtual Server HTTPS para cifrar el tráfico entre BIG-IP y los Pool Members.
-
-**Instrucciones:**
-
-1. Habilitar HTTPS en los servidores backend. En `web01` (`10.20.20.11`) vía SSH:
-
-   ```bash
-   sudo a2enmod ssl
-   sudo a2ensite default-ssl
-   sudo systemctl restart apache2
-   ```
-
-   Verificar que Apache escucha en el puerto 443:
-
-   ```bash
-   sudo ss -tlnp | grep :443
-   ```
-
-   **Salida esperada:** Línea mostrando `*:443` con `apache2`.
-
-2. Repetir el paso 1 en `web02` (`10.20.20.12`).
-
-3. Crear un pool alternativo con miembros en puerto 443 o modificar los miembros existentes. Para este laboratorio, crear un nuevo pool para el backend HTTPS:
-
-   ```bash
-   tmsh create ltm pool pool_webapp_ssl \
-       members add { 10.20.20.11:443 10.20.20.12:443 } \
-       monitor https
-   ```
-
-4. Crear el Server SSL Profile. Navegar a **Local Traffic → Profiles → SSL → Server → Create**:
-
-   | Campo | Valor |
-   |---|---|
-   | Name | `serverssl_lab` |
-   | Parent Profile | `serverssl-insecure-compatible` |
-
-   > **Nota:** Se utiliza `serverssl-insecure-compatible` porque los backends tienen certificados autofirmados de Apache por defecto. En producción se debe usar un perfil que valide el certificado del servidor.
-
-   Hacer clic en **Finished**.
-
-   Equivalente TMSH:
-
-   ```bash
-   tmsh create ltm profile server-ssl serverssl_lab \
-       defaults-from serverssl-insecure-compatible
-   ```
-
-5. Asociar el Server SSL Profile y el nuevo pool al Virtual Server HTTPS:
-
-   ```bash
-   tmsh modify ltm virtual vs_https_lab \
-       profiles add { serverssl_lab { context serverside } } \
-       pool pool_webapp_ssl
-   ```
-
-6. Verificar la configuración completa de perfiles:
-
-   ```bash
-   tmsh list ltm virtual vs_https_lab profiles
-   ```
-
-   **Salida esperada:** Debe incluir `clientssl_lab` (clientside), `serverssl_lab` (serverside), `tcp-wan-optimized` (clientside), `tcp-lan-optimized` (serverside) y `http_lab_custom`.
-
-7. Probar el cifrado extremo a extremo desde el cliente:
-
-   ```bash
-   curl -k https://10.10.10.101/
-   ```
-
-   **Salida esperada:** Contenido HTML del backend servido a través de HTTPS en ambos tramos.
-
-8. Verificar en los logs de BIG-IP que el handshake SSL del lado servidor se completa:
-
-   ```bash
-   tmsh show ltm pool pool_webapp_ssl members
-   ```
-
-   **Salida esperada:** Ambos miembros en estado `available` con el monitor `https` activo.
-
-**Verificación:**
-
-Desde el cliente, confirmar la cadena completa de cifrado:
-
-```bash
-curl -k -v https://10.10.10.101/ 2>&1 | grep -E "SSL connection|subject|issuer"
-```
-
-El handshake del lado cliente debe mostrar el certificado `lab.f5curso.local`. El tráfico hacia el backend viaja cifrado (verificable porque el pool usa puerto 443 con monitor HTTPS exitoso).
-
----
-
-### Paso 6: Configurar Priority Groups en Pool Members
-
-**Objetivo:** Asignar prioridades diferenciadas a los Pool Members, configurar Priority Group Activation y verificar la promoción automática del grupo de menor prioridad cuando el grupo principal pierde disponibilidad.
-
-**Instrucciones:**
-
-1. Asignar Priority Group 10 a `web01` y Priority Group 5 a `web02` en el pool `pool_webapp_ssl`:
-
-   ```bash
-   tmsh modify ltm pool pool_webapp_ssl members modify { 10.20.20.11:443 { priority-group 10 } 10.20.20.12:443 { priority-group 5 } }
-   ```
-
-2. Configurar Priority Group Activation con valor `1` (activar el grupo de menor prioridad cuando queden menos de 1 miembro disponible en el grupo de alta prioridad):
-
-   ```bash
-   tmsh modify ltm pool pool_webapp_ssl min-active-members 1
-   ```
-
-3. Verificar la configuración:
-
-   ```bash
-   tmsh list ltm pool pool_webapp_ssl members
-   ```
-
-   **Salida esperada:**
-
-   ```
-   ltm pool pool_webapp_ssl {
-       members {
-           10.20.20.11:443 {
-               priority-group 10
-           }
-           10.20.20.12:443 {
-               priority-group 5
-           }
-       }
-       min-active-members 1
-   }
-   ```
-
-4. Enviar múltiples solicitudes y verificar que todas se dirigen a `web01` (prioridad 10):
-
-   ```bash
-   tmsh delete ltm persistence persist-records all
-   for i in $(seq 1 6); do
-       curl -k -s https://10.10.10.101/ | grep -o "web0[12]"
-   done
-   ```
-
-   **Salida esperada:** Todas las respuestas deben indicar `web01`.
-
-5. Simular la caída del miembro de alta prioridad. En `web01` vía SSH:
-
-   ```bash
-   sudo systemctl stop apache2
-   ```
-
-6. Esperar 15-30 segundos para que el Health Monitor detecte la caída, luego verificar:
-
-   ```bash
-   tmsh show ltm pool pool_webapp_ssl members
-   ```
-
-   **Salida esperada:** `10.20.20.11:443` en estado `offline` o `down`; `10.20.20.12:443` en estado `available`.
-
-7. Enviar solicitudes y verificar que ahora se dirigen a `web02` (prioridad 5, promovido):
-
-   ```bash
-   for i in $(seq 1 4); do
-       curl -k -s https://10.10.10.101/ | grep -o "web0[12]"
-   done
-   ```
-
-   **Salida esperada:** Todas las respuestas indican `web02`.
-
-8. Restaurar el servicio en `web01`:
-
-   ```bash
-   sudo systemctl start apache2
-   ```
-
-9. Esperar a que el monitor marque `web01` como disponible y verificar que el tráfico regresa al grupo de prioridad 10:
-
-   ```bash
-   sleep 20
-   tmsh delete ltm persistence persist-records all
-   for i in $(seq 1 4); do
-       curl -k -s https://10.10.10.101/ | grep -o "web0[12]"
-   done
-   ```
-
-   **Salida esperada:** Las respuestas regresan a `web01`.
-
-**Verificación:**
-
-```bash
-tmsh show ltm pool pool_webapp_ssl
-```
-
-Confirmar que `Available Members` muestra 2, `min-active-members` es 1, y los Priority Groups están correctamente asignados.
-
----
-
-### Paso 7: Crear una iRule condicional basada en cabeceras HTTP
-
-**Objetivo:** Crear una iRule que inspeccione la cabecera HTTP `X-Lab-Route` y retorne una respuesta personalizada cuando su valor sea `secondary`, permitiendo enrutamiento condicional del tráfico.
-
-**Instrucciones:**
-
-1. Crear la iRule. Navegar a **Local Traffic → iRules → iRule List → Create**:
-
-   | Campo | Valor |
-   |---|---|
-   | Name | `lab_irule_redirect` |
-   | Definition | (ver código abajo) |
+1. En TMUI: **Local Traffic → iRules → iRule List → Create**.
+2. **Name = `irule_lab05`**. Pega en **Definition**:
 
    ```tcl
    when HTTP_REQUEST {
-       if { [HTTP::header value "X-Lab-Route"] eq "secondary" } {
-           HTTP::respond 200 content "iRule: Ruta secundaria activada para [IP::client_addr]" noserver
+       if { [string tolower [HTTP::header value "X-Lab-Mode"]] eq "diagnostico" } {
+           HTTP::respond 200 content "LAB05: respuesta generada por BIG-IP" Content-Type "text/plain; charset=utf-8"
            return
        }
    }
    ```
 
-   Hacer clic en **Finished**.
-
-   Equivalente TMSH:
-
-   ```bash
-   tmsh create ltm rule lab_irule_redirect { \
-       when HTTP_REQUEST { \
-           if { [HTTP::header value "X-Lab-Route"] eq "secondary" } { \
-               HTTP::respond 200 content "iRule: Ruta secundaria activada para [IP::client_addr]" noserver \
-               return \
-           } \
-       } \
-   }
-   ```
-
-2. Asociar la iRule al Virtual Server HTTPS:
+3. Pulsa **Finished**. Ve a **Local Traffic → Virtual Servers → Virtual Server List → vs_lab05_https → Resources**. En **iRules** selecciona `irule_lab05` de **Available**, pásala a **Enabled/Selected** y pulsa **Update**.
+4. Desde **Ubuntu Bash**:
 
    ```bash
-   tmsh modify ltm virtual vs_https_lab rules { lab_irule_redirect }
+   curl -ksS -H 'X-Lab-Mode: diagnostico' https://10.1.3.200:8443/
+   curl -ksS -H 'X-Lab-Mode: normal' https://10.1.3.200:8443/
+   curl -ksS https://10.1.3.200:8443/
    ```
 
-3. Verificar la asociación:
+   **Resultado esperado:** la primera solicitud muestra `LAB05: respuesta generada por BIG-IP`; las otras muestran contenido de Web01 o Web02. El backend no necesita participar para generar la respuesta de diagnóstico.
+5. En **BIG-IP TMSH**:
+
+   ```text
+   list ltm virtual vs_lab05_https rules
+   list ltm rule irule_lab05
+   ```
+
+**Análisis:** la presencia del perfil **Client SSL** permite a BIG-IP descifrar HTTPS; el perfil **HTTP** habilita el evento `HTTP_REQUEST`. Una iRule puede responder directamente sin enviar tráfico al backend, como ocurre aquí.
+
+## Paso 5. Priority Group Activation y conmutación controlada (5 min)
+
+**Problema que resuelve.** Queremos que Web01 atienda en condiciones normales y que Web02 sea reserva; esto es diferente de repartir tráfico 3:1, como en el Laboratorio 4.
+
+1. En TMUI: **Local Traffic → Pools → Pool List → pool_lab05 → Members**.
+2. En **Priority Group Activation**, cambia **Disabled** a **Less than**. Aparecerá el campo de cantidad de miembros disponibles; escribe **1**. Pulsa **Update**.
+3. En **Current Members**, entra al enlace **`10.1.2.4:80`**, cambia **Priority Group = 10** y pulsa **Update**.
+4. Entra al enlace **`10.1.2.5:80`**, cambia **Priority Group = 5** y pulsa **Update**. Comprueba ambos valores en la tabla **Current Members**.
+5. Desde **Ubuntu Bash**:
 
    ```bash
-   tmsh list ltm virtual vs_https_lab rules
+   for i in $(seq 1 4); do curl -ksS https://10.1.3.200:8443/; echo; done
    ```
 
-   **Salida esperada:**
+   **Resultado esperado:** todas las respuestas del servidor primario (`10.1.2.4`) porque su grupo tiene prioridad 10 y hay al menos un miembro disponible. Si la página no identifica al servidor, usa las estadísticas del pool para comprobar el miembro seleccionado.
+6. En **Local Traffic → Pools → Pool List → pool_lab05 → Members**, marca únicamente el miembro `10.1.2.4:80` y usa la acción **Disable** o **Force Offline**, según esté disponible. Espera a que su estado administrativo cambie y genera cuatro peticiones nuevas desde Ubuntu. Deberían ser atendidas por `10.1.2.5`.
+7. **Restaura inmediatamente** el miembro de Web01 con **Enable** desde el mismo menú, comprueba que vuelve a estar disponible y repite la prueba. Las nuevas conexiones deben preferir Web01.
+8. En **BIG-IP TMSH**:
 
-   ```
-   ltm virtual vs_https_lab {
-       rules {
-           lab_irule_redirect
-       }
-   }
+   ```text
+   list ltm pool pool_lab05 min-active-members
+   list ltm pool pool_lab05 members
+   show ltm pool pool_lab05 members
    ```
 
-4. Probar la iRule enviando la cabecera `X-Lab-Route: secondary`:
+**Diferencia importante:** `Disable` puede permitir determinadas conexiones existentes o persistentes según el estado de la aplicación; `Force Offline` retira de manera más estricta al miembro para conexiones nuevas. En estas pruebas se generan conexiones HTTP nuevas y el HTTPS de Lab05 **no tiene un perfil de persistencia asociado**.
+
+## Paso 6. Validación visual con Network Map y guardado (2 min)
+
+**Objetivo.** Utilizar **Network Map** para comprobar visualmente cómo se relacionan los Virtual Servers, pools y miembros y localizar rápidamente un componente con problemas. Esta vista permite diagnosticar la **disponibilidad** del servicio sin revisar cada objeto por separado.
+
+1. En **TMUI**, abre **Local Traffic → Network Map** desde el menú izquierdo. Si se abre una pestaña nueva del navegador, trabaja en esa pestaña.
+2. En la pantalla de resumen, identifica los grupos **Virtual Servers**, **Pools**, **Pool Members**, **Nodes** e **iRules** y observa los indicadores de estado. Según la configuración, puedes **buscar por nombre**, **filtrar por estado o tipo de objeto** y **ordenar** para localizar elementos de interés. Los nombres de los filtros y botones pueden variar ligeramente con la versión.
+3. Localiza `vs_lab05_http` y `vs_lab05_https` mediante el campo **Search** si está disponible. Aplica el filtro con **Update Summary** o el control equivalente y selecciona **Show Map** para mostrar las relaciones gráficas. Si ya aparece directamente el mapa, utiliza allí la búsqueda.
+4. Sigue visualmente esta relación para cada servicio: **Virtual Server → pool_lab05 → 10.1.2.4:80 / 10.1.2.5:80**. Comprueba que los dos miembros estén habilitados y disponibles. Recuerda que los dos Virtual Servers comparten el mismo pool: una falla del pool puede afectar a ambos servicios.
+5. **Explora sin modificar:** selecciona un objeto o su enlace para consultar sus detalles. Según la interfaz puedes acceder a la configuración, ver información en un panel de inspección y consultar estadísticas. Sitúa el cursor sobre el indicador de estado para conocer su significado. **Network Map es principalmente una herramienta de visualización y diagnóstico:** los cambios de persistencia, certificados, monitores o prioridad se realizan en las pantallas de configuración correspondientes.
+6. **Interpreta una incidencia:** si un miembro aparece rojo o deshabilitado, rastrea en el mapa qué pool y qué Virtual Servers dependen de él. Un miembro caído no implica necesariamente que el Virtual Server esté caído si el pool conserva otro miembro disponible. **Actualiza el mapa o la página** después de cualquier cambio, porque la vista no siempre se refresca automáticamente.
+7. Desde **Ubuntu Bash**, confirma que ambos servicios aún responden:
 
    ```bash
-   curl -k -H "X-Lab-Route: secondary" https://10.10.10.101/
+   curl -sS -o /dev/null -w 'HTTP: %{http_code}\n' http://10.1.3.200:8082/
+   curl -ksS -o /dev/null -w 'HTTPS: %{http_code}\n' https://10.1.3.200:8443/
    ```
 
-   **Salida esperada:**
+   **Resultado esperado:** `HTTP: 200` y `HTTPS: 200`, siempre que los dos servidores estén operativos. La prueba con `-k` omite la validación de confianza del certificado autofirmado solo en este laboratorio.
+8. Desde **BIG-IP TMSH**, guarda la configuración:
 
-   ```
-   iRule: Ruta secundaria activada para 10.10.10.10
-   ```
-
-5. Probar sin la cabecera (comportamiento normal, tráfico al pool):
-
-   ```bash
-   curl -k https://10.10.10.101/
+   ```text
+   save sys config
    ```
 
-   **Salida esperada:** Contenido HTML del backend (comportamiento normal del pool).
+**Resultado esperado:** el mapa permite identificar los dos Virtual Servers, su pool común y los miembros disponibles, sin perder los objetos de los laboratorios anteriores. Ambos miembros deben quedar habilitados y no se debe eliminar ningún objeto `lab05`.
 
-6. Probar con un valor diferente de la cabecera:
+**Qué puedes hacer con Network Map:** obtener un inventario visual de objetos LTM, ver las dependencias entre Virtual Servers y pools, identificar estados anómalos, filtrar para encontrar servicios concretos, inspeccionar los detalles de los objetos y acceder a sus estadísticas cuando la vista lo permita. **Qué no debes asumir:** que un estado verde demuestra una transacción HTTP exitosa o que el mapa sustituye las pruebas desde Ubuntu; por eso la comprobación funcional anterior sigue siendo necesaria.
 
-   ```bash
-   curl -k -H "X-Lab-Route: primary" https://10.10.10.101/
-   ```
+### Registro de resultados
 
-   **Salida esperada:** Contenido HTML del backend (la iRule solo actúa cuando el valor es exactamente `secondary`).
+| Prueba | Evidencia obtenida | Estado |
+|---|---|---|
+| Cookie Insert fija al cliente en un miembro | `Set-Cookie` + cinco solicitudes con el mismo backend | ☐ |
+| Source Address Affinity opera sin cookie insertada | Cinco solicitudes sin cookie + registro de persistencia | ☐ |
+| `X-Forwarded-For` aparece hacia backend | Solicitud `verificar_xff=999` + cabecera `X-Forwarded-For: 10.1.3.4` | ☐ |
+| Client SSL protege el tramo hasta BIG-IP | `curl -vk` con handshake y respuesta HTTP | ☐ |
+| iRule responde solo ante la cabecera específica | Tres solicitudes HTTP con respuestas distintas | ☐ |
+| Priority Group Activation prefiere y conmuta | Pruebas antes/después de deshabilitar Web01 | ☐ |
+| Network Map muestra dependencias y ambos miembros habilitados | `Local Traffic → Network Map` + `save sys config` | ☐ |
 
-7. Analizar el orden de procesamiento. Las iRules se ejecutan después de que los Profiles de protocolo (TCP, HTTP, SSL) hayan procesado la conexión. El Client SSL Profile descifra el tráfico TLS antes de que la iRule pueda inspeccionar las cabeceras HTTP. El HTTP Profile parsea las cabeceras antes de que el evento `HTTP_REQUEST` se dispare en la iRule.
+## Solución de problemas
 
-**Verificación:**
+| Síntoma | Comprobación y corrección |
+|---|---|
+| Pool Lab05 no se pone verde | En TMSH `show ltm pool pool_lab05 members`; en TMSH `run util bash -c "curl -I http://10.1.2.4/"` y repetir para `.5`; verificar el monitor HTTP y el puerto 80. |
+| `curl` a `:8082` o `:8443` termina en timeout | Confirmar en TMUI el Virtual Server y puerto, `list ltm virtual`, y que Ubuntu usa `eth1 10.1.3.4`. No modificar la IP de la Self IP. |
+| El perfil de persistencia no se aplica | Abrir el VS en **Resources** y comprobar **Default Persistence Profile**. Para Cookie Insert, revisar primero el encabezado `Set-Cookie` y el archivo jar. |
+| Se alterna entre backends aun enviando cookies | Comprobar que `curl -b` lee el archivo correcto, que el servidor responde 200 y que no se está usando un Virtual Server distinto. |
+| Source Address Affinity no muestra registros | Consultar inmediatamente tras generar tráfico; confirmar que el perfil realmente es el predeterminado del VS; verificar que no queda Cookie Insert. |
+| No aparece `X-Forwarded-For` en la captura | Comprobar `list ltm virtual vs_lab05_http profiles` y `list ltm profile http http_lab05_xff insert-xforwarded-for`; iniciar la captura con `grep --line-buffered -A 15` antes de enviar `?verificar_xff=999` desde Ubuntu; confirmar que la solicitud va a `:8082`. |
+| HTTPS no conecta pero HTTP sí | Revisar certificado y su clave en **SSL Certificate List**, la cadena certificado/clave de `clientssl_lab05` y los perfiles de `vs_lab05_https`. |
+| La iRule no muestra el texto | Confirmar el nombre de la cabecera `X-Lab-Mode`, el valor `diagnostico` y que la iRule esté habilitada en **Resources** del VS HTTPS. |
+| Web02 recibe tráfico aun con Web01 sano | Comprobar que **Priority Group Activation = Less than 1**, Web01 prioridad 10 y Web02 prioridad 5, y que `vs_lab05_https` apunta a `pool_lab05`. |
+| Después de la conmutación Web01 permanece fuera de servicio | Volver a **pool_lab05 → Members**, seleccionar `10.1.2.4:80` y **Enable**; revisar su estado y el monitor. |
 
-Verificar las estadísticas de la iRule:
+## Ampliaciones técnicas (fuera de los 60 minutos)
 
-```bash
-tmsh show ltm rule lab_irule_redirect
+### A. Server SSL: cifrar también hacia Apache
+
+En el ejercicio principal, `clientssl_lab05` cifra **Ubuntu → BIG-IP** y BIG-IP envía HTTP a `10.1.2.4:80` y `10.1.2.5:80`. Para cifrar **BIG-IP → Apache** también, se necesita habilitar HTTPS en **ambos** backends, crear un pool nuevo de miembros `:443`, configurar el monitor apropiado, asociar un **Server SSL Profile** y decidir cómo validar el certificado presentado por los servidores. No se debe asociar Server SSL a `pool_lab05:80` porque esos miembros esperan HTTP sin TLS. La mera presencia de un monitor HTTPS no demuestra que el tráfico de datos sea cifrado: debe comprobarse el perfil Server SSL y el handshake en el tramo interno.
+
+### B. Identificación de objetos iApp
+
+Una **iApp** puede crear y administrar objetos como Virtual Servers, pools y perfiles como una Application Service. En TMUI examina **iApps → Application Services → Applications** y, si existe una aplicación, abre sus **Components** y consulta los objetos que administra. En **BIG-IP TMSH** puedes consultar:
+
+```text
+list sys application service
+list sys application template
 ```
 
-**Salida esperada:** Contadores de eventos `HTTP_REQUEST` incrementados, con `Aborts` en 0 y sin errores.
-
----
-
-### Paso 8: Identificar objetos creados por una iApp de demostración
-
-**Objetivo:** Explorar una Application Service desplegada mediante iApp, identificar los objetos creados automáticamente y documentar las restricciones de modificación directa.
-
-**Instrucciones:**
-
-> **Nota:** Este paso requiere que el instructor haya pre-desplegado una iApp utilizando la plantilla `f5.http` incluida en BIG-IP 17.1.2. Si no se ha desplegado, el estudiante puede crear una Application Service de demostración siguiendo los sub-pasos 1–3. Si ya existe, saltar al sub-paso 4.
-
-1. Verificar las plantillas de iApp disponibles:
-
-   ```bash
-   tmsh list sys application template | grep "template "
-   ```
-
-   Confirmar que `f5.http` aparece en la lista.
-
-2. Si el instructor no ha pre-desplegado la iApp, crear una Application Service de demostración mediante TMUI. Navegar a **iApps → Application Services → Applications → Create**:
-
-   | Campo | Valor |
-   |---|---|
-   | Name | `demo_iapp_http` |
-   | Template | `f5.http` |
-
-   Completar los campos requeridos del asistente:
-   - **Virtual Server IP:** `10.10.10.102`
-   - **Virtual Server Port:** `80`
-   - **Pool Members:** Agregar `10.20.20.11:80` y `10.20.20.12:80`
-
-   Hacer clic en **Finished**.
-
-3. Esperar a que BIG-IP cree todos los objetos asociados.
-
-4. Navegar a **iApps → Application Services → demo_iapp_http → Components**. Documentar los objetos creados:
-
-   | Tipo de objeto | Nombre generado (ejemplo) |
-   |---|---|
-   | Virtual Server | `demo_iapp_http_vs` o similar |
-   | Pool | `demo_iapp_http_pool` o similar |
-   | HTTP Profile | Referencia al perfil `http` o uno personalizado |
-   | Monitor | Monitor asociado al pool |
-   | Nodes | Nodos referenciados por los Pool Members |
-
-   > **Nota:** Los nombres exactos dependen de la plantilla y versión. Registrar los nombres reales observados.
-
-5. Intentar modificar directamente uno de los objetos creados por la iApp. Navegar a **Local Traffic → Virtual Servers**, localizar el Virtual Server creado por la iApp e intentar cambiar su pool o algún parámetro.
-
-   **Resultado esperado:** BIG-IP muestra un mensaje de advertencia similar a:
-
-   > *"This object is managed by an application service. Changes made here will be overwritten by the application service. To make changes, edit the application service."*
-
-6. Documentar las restricciones observadas:
-
-   - Los objetos creados por una iApp están **vinculados** a la Application Service.
-   - Las modificaciones directas pueden ser sobrescritas al reconfigurar la iApp.
-   - Para modificar un objeto gestionado por iApp, se debe editar la Application Service o, en casos excepcionales, cambiar la propiedad de **Strict Updates** (no recomendado en producción).
-
-7. Verificar la propiedad de Strict Updates:
-
-   ```bash
-   tmsh list sys application service demo_iapp_http strict-updates
-   ```
-
-   **Salida esperada:** `strict-updates enabled`
-
-8. Verificar la lista completa de objetos dependientes:
-
-   ```bash
-   tmsh list sys application service demo_iapp_http
-   ```
-
-**Verificación:**
-
-El estudiante debe haber documentado al menos 3 tipos de objetos creados por la iApp (Virtual Server, Pool, Monitor/Profile) y haber observado el mensaje de restricción al intentar una modificación directa.
-
-## Validación y Pruebas
-
-Ejecutar las siguientes verificaciones para confirmar el estado final del laboratorio:
-
-### Prueba 1: Verificación integral de persistencia por cookie
-
-```bash
-## Obtener la cookie y verificar persistencia
-RESPONSE=$(curl -k -s -D - https://10.10.10.101/ -o /dev/null)
-COOKIE=$(echo "$RESPONSE" | grep -i "Set-Cookie: BIGipServer" | head -1 | sed 's/Set-Cookie: //' | cut -d';' -f1)
-echo "Cookie obtenida: $COOKIE"
-
-## Verificar que 5 solicitudes van al mismo backend
-for i in $(seq 1 5); do
-    curl -k -s -b "$COOKIE" https://10.10.10.101/ | grep -o "web0[12]"
-done
-```
-
-**Criterio de éxito:** Las 5 solicitudes retornan el mismo servidor backend.
-
-### Prueba 2: Verificación de cifrado extremo a extremo
-
-```bash
-## Verificar handshake TLS del lado cliente
-curl -k -v https://10.10.10.101/ 2>&1 | grep "subject: CN=lab.f5curso.local"
-
-## Verificar que el pool SSL tiene miembros activos
-tmsh show ltm pool pool_webapp_ssl members | grep -E "Addr|State|Monitor"
-```
-
-**Criterio de éxito:** El certificado del lado cliente muestra `CN=lab.f5curso.local` y ambos miembros del pool SSL están en estado `available` con monitor HTTPS exitoso.
-
-### Prueba 3: Verificación de Priority Groups
-
-```bash
-## Verificar configuración de prioridades
-tmsh list ltm pool pool_webapp_ssl members | grep -A2 "priority-group"
-
-## Verificar min-active-members
-tmsh list ltm pool pool_webapp_ssl min-active-members
-```
-
-**Criterio de éxito:** Prioridad 10 para `10.20.20.11:443`, prioridad 5 para `10.20.20.12:443`, `min-active-members 1`.
-
-### Prueba 4: Verificación de la iRule
-
-```bash
-## Con cabecera X-Lab-Route: secondary
-curl -k -s -H "X-Lab-Route: secondary" https://10.10.10.101/
-
-## Sin cabecera (debe ir al pool)
-HTTP_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" https://10.10.10.101/)
-echo "Código HTTP sin cabecera: $HTTP_CODE"
-```
-
-**Criterio de éxito:** Con la cabecera, respuesta contiene "Ruta secundaria activada"; sin la cabecera, código HTTP 200 con contenido del backend.
-
-### Prueba 5: Verificación de X-Forwarded-For y eliminación de cabecera Server
-
-```bash
-## Verificar ausencia de cabecera Server
-curl -k -sI https://10.10.10.101/ | grep -ci "^server:"
-```
-
-**Criterio de éxito:** El comando `grep` retorna `0` (sin coincidencias) o la cabecera Server muestra un valor vacío/modificado.
-
-### Prueba 6: Caso adverso — Comportamiento con entrada no válida en iRule
-
-```bash
-## Enviar cabecera con valor vacío
-curl -k -s -H "X-Lab-Route: " https://10.10.10.101/ | head -5
-
-## Enviar cabecera con caracteres especiales
-curl -k -s -H "X-Lab-Route: <script>alert(1)</script>" https://10.10.10.101/ | head -5
-
-## Enviar múltiples cabeceras X-Lab-Route
-curl -k -s -H "X-Lab-Route: primary" -H "X-Lab-Route: secondary" https://10.10.10.101/ | head -5
-```
-
-**Criterio de éxito:** En ningún caso la iRule debe generar errores (verificar `tmsh show ltm rule lab_irule_redirect` — Aborts debe ser 0). Con valor vacío o caracteres especiales, el tráfico debe pasar al pool normalmente. Con cabeceras duplicadas, documentar cuál valor toma precedencia (BIG-IP típicamente usa el primer valor encontrado).
-
-### Resumen de estado final
-
-```bash
-## Comando consolidado de verificación
-echo "=== Virtual Servers ==="
-tmsh show ltm virtual vs_http_lab | grep -E "Availability|State|Destination"
-tmsh show ltm virtual vs_https_lab | grep -E "Availability|State|Destination"
-echo "=== Pool webapp_ssl ==="
-tmsh show ltm pool pool_webapp_ssl members | grep -E "Addr|Avail|State|Priority"
-echo "=== Profiles en vs_https_lab ==="
-tmsh list ltm virtual vs_https_lab profiles
-echo "=== iRule stats ==="
-tmsh show ltm rule lab_irule_redirect | grep -E "Event|Total|Aborts"
-```
-
-## Solución de Problemas
-
-### Problema 1: El Virtual Server HTTPS muestra estado "Offline" o no responde en puerto 443
-
-**Síntomas:** Al ejecutar `curl -k https://10.10.10.101/` se obtiene `Connection refused` o timeout. En TMUI, `vs_https_lab` aparece con icono rojo o gris.
-
-**Causa:** El Client SSL Profile no está correctamente asociado al Virtual Server, o el certificado/clave no se importaron correctamente. También puede ocurrir si el perfil HTTP se asignó sin un Client SSL Profile en un Virtual Server en puerto 443, lo que impide el procesamiento del handshake TLS.
-
-**Solución:**
-
-```bash
-## Verificar los perfiles asignados
-tmsh list ltm virtual vs_https_lab profiles
-
-## Verificar que el certificado y la clave existen
-tmsh list sys crypto cert lab_f5curso_cert
-tmsh list sys crypto key lab_f5curso_key
-
-## Verificar que el Client SSL Profile referencia correctamente el par
-tmsh list ltm profile client-ssl clientssl_lab cert-key-chain
-
-## Si falta el perfil SSL, reasociarlo
-tmsh modify ltm virtual vs_https_lab profiles add { clientssl_lab { context clientside } }
-
-## Verificar que el Virtual Server escucha en la IP correcta
-tmsh show ltm virtual vs_https_lab | grep Destination
-
-## Verificar logs de errores SSL
-tail -20 /var/log/ltm | grep -i ssl
-```
-
-Si el certificado no fue importado correctamente, reimportar con:
-
-```bash
-tmsh install sys crypto cert lab_f5curso_cert from-local-file /var/tmp/lab_f5curso.crt
-tmsh install sys crypto key lab_f5curso_key from-local-file /var/tmp/lab_f5curso.key
-```
-
-### Problema 2: Priority Group Activation no promueve el grupo de menor prioridad al desactivar el miembro principal
-
-**Síntomas:** Tras detener Apache en `web01`, las solicitudes a `https://10.10.10.101/` fallan con error en lugar de ser redirigidas a `web02`. O bien, ambos miembros reciben tráfico simultáneamente sin respetar las prioridades.
-
-**Causa:** El valor de `min-active-members` no está configurado correctamente, o los Priority Groups no se asignaron al pool correcto (`pool_webapp_ssl` vs. `pool_webapp`). Otra causa frecuente es que el Health Monitor no ha detectado aún la caída del servicio (intervalo de comprobación demasiado largo).
-
-**Solución:**
-
-```bash
-## Verificar que las prioridades están en el pool correcto
-tmsh list ltm pool pool_webapp_ssl members
-
-## Verificar min-active-members
-tmsh list ltm pool pool_webapp_ssl min-active-members
-
-## Si min-active-members no está configurado, establecerlo
-tmsh modify ltm pool pool_webapp_ssl min-active-members 1
-
-## Verificar qué pool usa el Virtual Server
-tmsh list ltm virtual vs_https_lab pool
-
-## Si el VS apunta al pool incorrecto, corregir
-tmsh modify ltm virtual vs_https_lab pool pool_webapp_ssl
-
-## Verificar el estado actual de los miembros
-tmsh show ltm pool pool_webapp_ssl members
-
-## Si el monitor no ha detectado la caída, verificar el intervalo
-tmsh list ltm monitor https interval timeout
-
-## Forzar una comprobación verificando manualmente
-curl -k https://10.20.20.11/ 2>&1 | head -5
-```
-
-Si ambos miembros reciben tráfico simultáneamente, verificar que los Priority Groups están asignados con valores **diferentes** (no ambos en 10) y que `min-active-members` es mayor que 0.
-
-## Limpieza
-
-> **Importante:** Este laboratorio establece configuraciones que serán utilizadas en los laboratorios posteriores del Módulo 4 (Alta Disponibilidad). **No eliminar** los siguientes objetos: `vs_https_lab`, `pool_webapp_ssl`, `clientssl_lab`, `serverssl_lab`, `http_lab_custom`, `persist_cookie_lab`, Priority Groups configurados y la iRule `lab_irule_redirect`.
-
-Eliminar únicamente los objetos de la iApp de demostración si no serán necesarios:
-
-```bash
-## Eliminar la Application Service de demostración (esto elimina todos sus objetos dependientes)
-tmsh delete sys application service demo_iapp_http
-```
-
-Revertir las modificaciones de diagnóstico en los servidores backend:
-
-```bash
-## En web01 y web02: eliminar el log personalizado de X-Forwarded-For
-sudo sed -i '/xfflog/d' /etc/apache2/apache2.conf
-sudo sed -i '/xff_access/d' /etc/apache2/sites-enabled/000-default.conf
-sudo systemctl reload apache2
-```
-
-Eliminar el perfil de Source Address Affinity si no se utilizará más:
-
-```bash
-tmsh delete ltm persistence source-addr persist_srcaddr_lab
-```
-
-Guardar la configuración:
-
-```bash
-tmsh save sys config
-```
+No se presupone que la plantilla `f5.http` exista ni que se haya desplegado una iApp. Si no hay Application Services, registra **«No hay iApps desplegadas»**. En una iApp existente, **Strict Updates** restringe la edición independiente de objetos administrados; no lo desactives ni modifiques aplicaciones ajenas durante este laboratorio.
 
 ## Resumen
 
-En este laboratorio se aplicaron siete configuraciones avanzadas que amplían significativamente las capacidades del Virtual Server construido en los laboratorios anteriores:
+En la práctica comprobaste una progresión de control LTM: de **balancear conexiones** a **mantener sesiones**, **añadir información HTTP**, **terminar TLS**, **tomar decisiones mediante iRules** y **seleccionar servidores por prioridades**. La operación segura exige distinguir el estado del monitor, el estado administrativo de un miembro y la persistencia, y comprobar siempre cuál de los dos tramos de comunicación está cifrado.
 
-1. **Persistence Profiles:** Se crearon y compararon Cookie Persistence (HTTP Cookie Insert) y Source Address Affinity, verificando que el primer mecanismo opera a nivel de cabeceras HTTP mientras el segundo persiste por dirección IP sin modificar el tráfico.
+## Recursos oficiales
 
-2. **TCP y HTTP Profiles:** Se asignaron perfiles TCP optimizados diferenciados para los lados cliente (`tcp-wan-optimized`) y servidor (`tcp-lan-optimized`), y se creó un HTTP Profile personalizado que inserta `X-Forwarded-For` y elimina la cabecera `Server`, mejorando la visibilidad del origen real y reduciendo la exposición de información del backend.
-
-3. **Client SSL Profile:** Se generó un certificado autofirmado con OpenSSL 3.0.2, se importó al BIG-IP y se creó un Client SSL Profile para habilitar HTTPS en el Virtual Server `vs_https_lab`.
-
-4. **Server SSL Profile:** Se habilitó cifrado extremo a extremo configurando HTTPS en los backends y asociando un Server SSL Profile al Virtual Server.
-
-5. **Priority Groups:** Se implementó distribución de carga priorizada con failover automático, verificando que BIG-IP promueve miembros de menor prioridad únicamente cuando el grupo principal pierde disponibilidad.
-
-6. **iRules:** Se creó lógica condicional basada en cabeceras HTTP, demostrando la capacidad de BIG-IP para tomar decisiones de enrutamiento programáticas a nivel de aplicación.
-
-7. **iApps:** Se identificaron las dependencias y restricciones de los objetos gestionados por Application Services, comprendiendo que las modificaciones directas pueden ser sobrescritas por el framework de iApp.
-
-Estos conceptos se alinean directamente con los dominios **F5CAB3.01** (identificación y configuración de objetos LTM) y **F5CAB3.02** (procesamiento de tráfico y perfiles). El estado resultante del laboratorio — un Virtual Server HTTPS con persistencia, perfiles optimizados, SSL de extremo a extremo, Priority Groups e iRule activa — constituye la base operativa para los laboratorios de Alta Disponibilidad del Módulo 4.
-
-### Recursos adicionales
-
-- [F5 BIG-IP LTM 17.1 — Persistence Profiles](https://techdocs.f5.com/en-us/bigip-17-1-0/big-ip-local-traffic-manager-profiles-reference/persistence-profiles.html)
-- [F5 BIG-IP LTM 17.1 — SSL Profiles](https://techdocs.f5.com/en-us/bigip-17-1-0/big-ip-local-traffic-manager-profiles-reference/ssl-profiles.html)
-- [F5 iRules DevCentral — Wiki y ejemplos](https://community.f5.com/kb/technicalarticles/irules-101---getting-started-with-irules/279711)
-- [F5 BIG-IP 17.1 — Priority Group Activation](https://techdocs.f5.com/en-us/bigip-17-1-0/big-ip-local-traffic-manager-monitors-reference.html)
-- [Referencia TMSH — ltm pool](https://clouddocs.f5.com/cli/tmsh-reference/latest/modules/ltm/ltm_pool.html)
+- [F5 BIG-IP 21.0 — Administración de certificados SSL](https://techdocs.f5.com/en-us/bigip-21-0-0/big-ip-system-ssl-administration/ssl-certificate-management.html)
+- [F5 — Pools y Priority Group Activation](https://techdocs.f5.com/kb/en-us/products/big-ip_ltm/manuals/product/ltm-basics-11-6-0/4.html)
+- [F5 — Referencia TMSH](https://clouddocs.f5.com/cli/tmsh-reference/latest/)
