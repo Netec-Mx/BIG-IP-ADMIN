@@ -1,2061 +1,1301 @@
 # Laboratorio 8 — Diagnóstico de red y rendimiento en BIG-IP: estadísticas, interfaces, tcpdump, drops, TCP y utilización de recursos
 
+
 ## Metadatos
 
 | Campo | Valor |
 |---|---|
-| **Duración** | 60 minutos |
-| **Complejidad** | Alta |
-| **Nivel Bloom** | Aplicar (Apply) |
-| **Versión BIG-IP** | F5 BIG-IP VE 17.1.2 |
-| **Alineación certificación** | F5CAB5.01, F5CAB5.02, F5CAB5.06, F5CAB5.07 |
+| Duración | **60 minutos** |
+| Modalidad | **Práctica individual, 100 % ejecutable en el pod** |
+| Complejidad | Alta |
+| Nivel | Administración y troubleshooting de BIG-IP LTM; preparación para certificación |
+| Requisito | Laboratorios 1–7 completados; un único BIG-IP VE operativo |
 
-## Descripción General
+## Objetivo
 
-Este laboratorio integra las técnicas de diagnóstico de rendimiento y red en BIG-IP VE 17.1.2. A lo largo de seis fases secuenciales, se recopilan métricas de línea base (CPU, memoria, disco, interfaces), se provocan condiciones de falla controladas, se ejecutan capturas de paquetes con `tcpdump`, se diagnostican escenarios de degradación en Virtual Servers y Pools, y se genera un QKView para análisis en iHealth. Cada fase produce evidencia documentada que sustenta la causa raíz identificada, aplicando una metodología de troubleshooting estructurada de extremo a extremo.
+Diagnosticar un servicio HTTP en BIG-IP siguiendo **establecer línea base → localizar la falla → capturar evidencia → corregir → verificar**, utilizando TMSH, TMUI, `tcpdump`, estadísticas, registros y QKView. Al finalizar, el estudiante será capaz de distinguir un problema de disponibilidad de pool de un problema de red, observar las conexiones cliente/servidor y justificar sus conclusiones mediante evidencia.
 
-## Objetivos de Aprendizaje
+> **Alcance real:** todas las pruebas obligatorias se realizan con los equipos disponibles. No se presupone acceso a Web01/Web02, una segunda instancia BIG-IP, Wireshark, `ab` ni una cuenta de iHealth. El análisis en iHealth es una ampliación opcional fuera de los 60 minutos. La generación de QKView sí forma parte de la práctica.
 
-Al completar este laboratorio serás capaz de:
+## Topología existente
 
-- [ ] Consultar y correlacionar métricas de CPU, memoria, disco e interfaces del Control Plane y Data Plane de BIG-IP para identificar cuellos de botella y establecer una línea base operativa.
-- [ ] Ejecutar capturas de paquetes filtradas con `tcpdump` en BIG-IP, transferirlas vía SCP y analizar en Wireshark retransmisiones TCP, resets y patrones anómalos del three-way handshake.
-- [ ] Diagnosticar problemas de disponibilidad y rendimiento en Virtual Servers y Pool Members correlacionando estados configurados vs. disponibilidad, fallas de Health Monitors, connection limits y perfiles TCP.
-- [ ] Generar un QKView, descargarlo y cargarlo en iHealth para obtener diagnósticos automatizados, documentando la evidencia que sustenta cada causa raíz identificada.
-- [ ] Aplicar troubleshooting estructurado verificando estadísticas de interfaces (drops, errores, speed/duplex) y estadísticas de tráfico por objeto para clasificar problemas entre capacidad, red física o configuración.
+```mermaid
+flowchart LR
+    U["Ubuntu (cliente)\neth0 10.1.1.246\neth1 10.1.3.4"] -->|"HTTP :8083 (Lab 8)"| B["BIG-IP VE\nMgmt 10.1.1.200\nExternal 10.1.3.200\nInternal 10.1.2.200"]
+    B -->|"SNAT AutoMap"| P["pool_lab08"]
+    P --> W1["Web01\n10.1.2.4:80"]
+    P --> W2["Web02\n10.1.2.5:80"]
+```
 
-## Prerrequisitos
+**Objetos existentes que no deben alterarse:** Virtual Servers de laboratorios anteriores en `10.1.3.200:8080`, `:8081`, `:8082` y `:8443` (según los objetos configurados en cada pod), y sus pools, monitores y perfiles. Se creará un servicio **independiente en `:8083`**.
 
-### Conocimientos requeridos
-
-| Área | Detalle |
+| Acceso | Datos |
 |---|---|
-| BIG-IP GUI y CLI | Navegación en Configuration Utility (TMUI) y acceso SSH con usuario `admin`; comandos básicos de `tmsh` (`show`, `list`, `modify`) |
-| Redes TCP/IP | Modelo OSI capas 3-7, three-way handshake TCP, conceptos de MTU, speed/duplex |
-| Laboratorios previos | Haber completado los Laboratorios 1-7 del curso con la topología persistente operativa |
-| Herramientas de análisis | Uso básico de Wireshark para inspección de capturas `.pcap` |
+| BIG-IP TMUI | `https://10.1.1.200` desde Ubuntu |
+| BIG-IP SSH | `ssh adminazure@10.1.1.200` |
+| Cliente de pruebas | Terminal Ubuntu |
+| Backend | Web01 `10.1.2.4:80` y Web02 `10.1.2.5:80` |
 
-### Acceso y herramientas requeridas
+**Cómo interpretar las consolas:** `adminazure` inicia sesión directamente en **TMSH**. En TMSH se escriben `show`, `list`, `create`, `modify`, `delete` sin anteponer `tmsh`. Para utilizar Linux: `run util bash`; para regresar: `exit`. En las secciones se indica explícitamente dónde ejecutar cada comando. Todos los comandos son de una sola línea.
 
-| Recurso | Versión exacta | Propósito |
-|---|---|---|
-| F5 BIG-IP VE | 17.1.2 ([Descarga MyF5](https://my.f5.com/manage/s/downloads)) | Plataforma de diagnóstico |
-| Ubuntu Server (web01, web02) | 22.04.4 LTS ([Descarga Ubuntu](https://releases.ubuntu.com/22.04.4/)) | Servidores web del pool |
-| Apache HTTP Server | 2.4.58 (incluido en Ubuntu 22.04.4 LTS) | Servicio HTTP en pool members |
-| Apache Benchmark (`ab`) | 2.4.58 (paquete `apache2-utils`) | Generación de carga HTTP controlada |
-| curl | 8.5.0 (incluido en Ubuntu 22.04.4 LTS) | Pruebas de conectividad HTTP |
-| Wireshark | 4.2.3 ([Descarga Wireshark](https://www.wireshark.org/download.html)) | Análisis de capturas `.pcap` |
-| Cliente SCP (WinSCP o `scp` CLI) | WinSCP 6.3.3 ([Descarga WinSCP](https://winscp.net/eng/download.php)) o `scp` nativo | Transferencia de archivos desde BIG-IP |
-| Cuenta F5 iHealth | N/A ([Portal iHealth](https://ihealth.f5.com/)) | Análisis automatizado de QKView |
-| Mozilla Firefox ESR | 128.0 ESR | Acceso a TMUI de BIG-IP |
+## Distribución de tiempo
 
-## Entorno de Laboratorio
-
-### Topología de red
-
-```
-┌──────────────┐        VLAN External         ┌──────────────┐        VLAN Internal        ┌──────────────┐
-│   Cliente     │       10.10.10.0/24          │   BIG-IP VE  │       10.20.20.0/24         │   web01       │
-│ 10.10.10.10   │◄────────────────────────────►│ ext: .245     │◄────────────────────────────►│ 10.20.20.11   │
-│               │                              │ int: .245     │                              ├──────────────┤
-│               │        Management            │ mgmt: .245    │                              │   web02       │
-│               │       192.0.2.0/24           │               │                              │ 10.20.20.12   │
-└──────────────┘                              └──────────────┘                              └──────────────┘
-  Admin: 192.0.2.10 ◄─── mgmt ───► 192.0.2.245
-```
-
-### Direccionamiento IP
-
-| Componente | Red | Dirección IP | Interfaz BIG-IP |
-|---|---|---|---|
-| Cliente (pruebas) | External | 10.10.10.10/24 | — |
-| Cliente (admin) | Management | 192.0.2.10/24 | — |
-| BIG-IP Management | Management | 192.0.2.245/24 | mgmt |
-| BIG-IP External Self IP | External | 10.10.10.245/24 | 1.1 |
-| BIG-IP Internal Self IP | Internal | 10.20.20.245/24 | 1.2 |
-| Virtual Server HTTP | External | 10.10.10.100:80 | — |
-| web01 | Internal | 10.20.20.11/24 | — |
-| web02 | Internal | 10.20.20.12/24 | — |
-
-### Estado esperado previo al laboratorio
-
-Antes de iniciar, verifica que el entorno heredado de los Laboratorios 1-7 cumple estos requisitos mínimos:
-
-```bash
-## Desde el cliente de administración (192.0.2.10), conectar por SSH:
-ssh admin@192.0.2.245
-
-## En tmsh, verificar Virtual Server HTTP activo:
-tmsh show ltm virtual vs_http
-
-## Verificar Pool con 2 members disponibles:
-tmsh show ltm pool pool_http
-
-## Verificar Health Monitor HTTP aplicado:
-tmsh list ltm pool pool_http monitor
-
-## Verificar perfiles TCP y HTTP aplicados al Virtual Server:
-tmsh list ltm virtual vs_http profiles
-```
-
-**Resultado esperado:** El Virtual Server `vs_http` debe mostrar estado `available` (verde), el pool `pool_http` debe tener 2 members activos (`10.20.20.11:80` y `10.20.20.12:80`) y los perfiles `tcp` y `http` deben estar asociados.
-
-> **Nota:** Si los nombres de objetos difieren de los indicados (por ejemplo, `vs_web_http` en lugar de `vs_http`), sustituye consistentemente a lo largo del laboratorio. Los nombres utilizados aquí son representativos.
-
-### Instalación de Apache Benchmark en el cliente
-
-Si `ab` no está instalado en la máquina cliente (10.10.10.10):
-
-```bash
-sudo apt update && sudo apt install -y apache2-utils
-ab -V
-## Salida esperada: This is ApacheBench, Version 2.3 <$Revision: ...>
-```
-
-## Instrucciones Paso a Paso
+| Etapa | Actividad | Tiempo |
+|---|---|---:|
+| 1 | Crear el servicio aislado y comprobar HTTP | 10 min |
+| 2 | Línea base de CPU, memoria, interfaces y conexiones | 7 min |
+| 3 | Captura `tcpdump`: cliente, VIP y backend | 10 min |
+| 4 | Provocar, diagnosticar y corregir dos fallas | 16 min |
+| 5 | Prueba concurrente de límite de conexiones del VS | 7 min |
+| 6 | QKView, validación final y limpieza | 10 min |
+| **Total** | | **60 min** |
 
 ---
 
-### Paso 1: Recopilación de línea base de recursos del sistema (Fase 1 — Baseline)
+## Etapa 1. Preparar un servicio de diagnóstico independiente — 10 min
 
-**Objective:** Capturar métricas de CPU, memoria, disco e interfaces en condiciones normales de operación para establecer una referencia de comparación durante el diagnóstico posterior.
+**Objetivo:** aislar los experimentos para no modificar los Virtual Servers de los laboratorios anteriores.
 
-**Instructions:**
-
-1. Conéctate por SSH al BIG-IP desde el cliente de administración:
+### 1.1 Comprobar conectividad (Ubuntu Bash)
 
 ```bash
-ssh admin@192.0.2.245
+curl --noproxy '*' -s -o /dev/null -w 'Web01 HTTP=%{http_code}\n' http://10.1.2.4/
+curl --noproxy '*' -s -o /dev/null -w 'Web02 HTTP=%{http_code}\n' http://10.1.2.5/
 ```
 
-2. Ejecuta los siguientes comandos en `tmsh` y registra la salida de cada uno en tu plantilla de documentación. Copia cada salida completa:
+**Esperado:** `HTTP=200` en ambos. Si Ubuntu no tiene ruta hacia la red interna, **no cambies rutas**: ejecuta estas mismas pruebas desde BIG-IP TMSH mediante `run util bash -c "curl -I http://10.1.2.4/"` y repite para `.5`.
+
+### 1.2 Crear los objetos (BIG-IP TMSH)
+
+Antes de cada `create`, comprueba que el objeto no exista; si ya fue creado por una ejecución anterior, **no lo dupliques**:
+
+```text
+list ltm pool pool_lab08
+list ltm monitor http mon_lab08
+list ltm virtual vs_lab08_http
+```
+
+Si aparecen como inexistentes, ejecuta en este orden:
+
+```text
+create ltm monitor http mon_lab08 defaults-from http
+create ltm pool pool_lab08 members add { 10.1.2.4:80 10.1.2.5:80 } monitor mon_lab08 load-balancing-mode round-robin
+create ltm virtual vs_lab08_http destination 10.1.3.200:8083 ip-protocol tcp pool pool_lab08 profiles add { tcp http } source-address-translation { type automap }
+```
+
+> Si un objeto ya existe, **consulta su configuración** con `list` antes de continuar. No reemplaces un objeto de otro laboratorio.
+
+### 1.3 Validar (BIG-IP TMSH y Ubuntu)
+
+```text
+show ltm pool pool_lab08 members
+show ltm virtual vs_lab08_http
+```
+
+Desde **Ubuntu**:
 
 ```bash
-## 2a. Rendimiento general del sistema
-tmsh show sys performance all-stats
-
-## 2b. Utilización de CPU — detalle por núcleo
-tmsh show sys cpu
-
-## 2c. Estado de memoria del sistema
-tmsh show sys memory
-
-## 2d. Utilización de disco por partición
-tmsh show sys disk
-
-## 2e. Estadísticas de todas las interfaces de red
-tmsh show net interface all
+curl --noproxy '*' -s -w '\nHTTP %{http_code}\n' http://10.1.3.200:8083/
 ```
 
-3. Desde la GUI (TMUI), navega a **Statistics > Performance > System** y captura una imagen de la gráfica de CPU y memoria de los últimos 30 minutos. Registra la hora exacta de la captura.
+**Esperado:** respuesta `WEB01` o `WEB02` y HTTP `200`; los dos members deben estar `available`. En TMUI utiliza **Local Traffic → Network Map** para identificar `vs_lab08_http`, `pool_lab08` y los miembros.
 
-4. Navega a **Statistics > Module Statistics > Local Traffic** y selecciona **Virtual Servers** en el menú desplegable. Registra las estadísticas actuales del Virtual Server `vs_http`: conexiones actuales, total de conexiones, bytes in/out.
-
-5. Accede a la shell de Bash para obtener estadísticas detalladas de TMM:
-
-```bash
-## Desde tmsh, cambiar a bash:
-bash
-
-## Estadísticas de TMM
-tmctl -d blade tmm/global_host_cpu_usage
-
-## Estadísticas de interfaces a nivel de kernel
-netstat -i
-
-## Regresar a tmsh
-exit
-```
-
-6. Genera una prueba de conectividad básica desde el cliente de pruebas (10.10.10.10) para confirmar el funcionamiento normal:
-
-```bash
-## Desde el cliente (10.10.10.10):
-curl -s -o /dev/null -w "HTTP Code: %{http_code} | Time Total: %{time_total}s\n" http://10.10.10.100
-```
-
-7. Ejecuta una carga moderada con `ab` para observar el comportamiento base:
-
-```bash
-## Desde el cliente (10.10.10.10):
-ab -n 500 -c 10 http://10.10.10.100/
-```
-
-8. Inmediatamente después de que `ab` finalice, vuelve a ejecutar en BIG-IP:
-
-```bash
-tmsh show sys cpu
-tmsh show ltm virtual vs_http
-tmsh show ltm pool pool_http members
-```
-
-**Expected output:**
-
-- `tmsh show sys cpu`: Porcentajes de utilización por núcleo. En condiciones de línea base con carga moderada, los valores típicos de TMM en un laboratorio estarán por debajo del 30%.
-- `tmsh show sys memory`: Memoria total asignada (TMM Memory Used, Other Memory Used, Memory Available). No debe haber indicadores de swap activo significativo.
-- `tmsh show sys disk`: Particiones `/`, `/var`, `/shared` con porcentaje de uso. Ninguna partición debe superar el 85%.
-- `tmsh show net interface all`: Interfaces `mgmt`, `1.1` y `1.2` con estado `up`, sin errores ni drops.
-- `curl`: HTTP Code 200, tiempo total inferior a 1 segundo.
-- `ab`: Requests per second, tiempo medio por solicitud y porcentaje de solicitudes exitosas (debe ser 100%).
-
-**Verification:**
-
-Confirma que dispones de los siguientes datos documentados para tu línea base:
-
-```bash
-## Verificar que no hay errores ni drops en las interfaces:
-tmsh show net interface 1.1 | grep -i -E "error|drop"
-tmsh show net interface 1.2 | grep -i -E "error|drop"
-## Resultado esperado: Counters en 0 o valores estables bajos
-```
-
-> **Documentación requerida:** Registra en tu plantilla: (1) Fecha y hora, (2) CPU por núcleo, (3) Memoria total/usada/disponible, (4) Disco por partición, (5) Estado y contadores de interfaces, (6) Estadísticas del Virtual Server, (7) Resultado de `ab`.
+**Evidencia:** nombre del VS, dirección:puerto, pool y estado de sus miembros.
 
 ---
 
-### Paso 2: Análisis de interfaces y detección de drops (Fase 2 — Interfaces)
+## Etapa 2. Interpretar CPU, memoria, interfaces y estado del servicio — 7 min
 
-**Objective:** Examinar estadísticas detalladas de interfaces para identificar errores, drops y validar la configuración de speed/duplex. Introducir una discrepancia controlada para observar su impacto.
+**Objetivo:** obtener una línea base de BIG-IP y saber **qué número buscar, dónde encontrarlo y qué significa**. Solo se anotan los campos indicados; no copies las salidas completas. Los valores de ejemplo se obtuvieron de un BIG-IP de este curso y **pueden variar en tu pod**.
 
-**Instructions:**
+> **Importante:** esta etapa es de **observación**. No cambies parámetros de CPU, memoria, interfaces ni discos. Si un valor llama tu atención, regístralo como *indicio*, no como falla demostrada.
 
-1. Desde `tmsh`, obtén estadísticas detalladas de cada interfaz:
+### 2.1 CPU: identificar utilización actual y núcleos — 2 min
 
-```bash
-tmsh show net interface 1.1 detail
-tmsh show net interface 1.2 detail
+En la consola **TMSH**:
+
+```text
+show sys cpu
 ```
 
-2. Documenta los siguientes campos para cada interfaz:
+Busca **dos lugares** en la salida:
 
-| Campo | Interfaz 1.1 | Interfaz 1.2 |
-|---|---|---|
-| Status | | |
-| Speed (actual) | | |
-| Duplex (actual) | | |
-| Packets In | | |
-| Packets Out | | |
-| Bytes In | | |
-| Bytes Out | | |
-| Errors In | | |
-| Errors Out | | |
-| Drops In | | |
-| Drops Out | | |
-| Collisions | | |
+**A. Primera tabla: `System CPU Usage(%)`**
 
-3. Verifica la configuración actual de media (speed/duplex) de la interfaz 1.1:
-
-```bash
-tmsh list net interface 1.1
+```text
+System CPU Usage(%)  Current  Average  Max(since ...)
+Utilization                4        4             48
 ```
 
-4. **Introducción de discrepancia controlada:** Modifica la configuración de la interfaz 1.1 para forzar un media type fijo que difiera de la negociación automática. Este cambio provocará una condición observable:
+- **Current:** utilización global actual. Anota este valor.
+- **Average:** promedio mostrado por BIG-IP. Es una referencia, no necesariamente el promedio de esta actividad.
+- **Max:** máximo desde la fecha que indica el encabezado; **no significa** que la CPU esté actualmente al 48 %.
 
-```bash
-## Guardar configuración actual para restauración:
-tmsh list net interface 1.1 media-fixed > /var/tmp/if11_backup.txt
+**B. Sección `Sys::Host CPUs`**
 
-## Forzar half-duplex en la interfaz 1.1:
-tmsh modify net interface 1.1 media-fixed 100baseTX-HD
+```text
+CPU: 1 ...
+User                      9
+System                    3
+Idle                     84
+Iowait                    0
+Util% (last 5 sec)       12
 ```
 
-> **Advertencia:** Este cambio puede causar degradación temporal de conectividad en la VLAN External. Es un cambio deliberado para el ejercicio.
+Busca el campo **`Util% (last 5 sec)`** de cada CPU (`CPU: 0`, `CPU: 1`, etc.) e identifica **el núcleo más ocupado**. `Idle` es tiempo inactivo e `Iowait` es espera de operaciones de entrada/salida. No necesitas transcribir todos los núcleos.
 
-5. Espera 10 segundos y verifica el estado resultante:
+**Ejemplo real:** CPU global actual **4 %**, CPU individual más ocupada **12 %**. **Interpretación:** no se observa saturación de CPU en ese momento. Esta salida de CPU de host no reemplaza la medición específica de TMM.
 
-```bash
-tmsh show net interface 1.1 detail
+### 2.2 Memoria: separar TMM, otros procesos y swap — 2 min
+
+```text
+show sys memory
 ```
 
-6. Genera tráfico desde el cliente para observar el impacto:
+**Detente en el encabezado** `Memory Used(%)`. No necesitas revisar las cientos de líneas de `Sys::SubSystem Memory`.
 
-```bash
-## Desde el cliente (10.10.10.10):
-ab -n 200 -c 5 http://10.10.10.100/
+```text
+Memory Used(%)     Current  Average  Max(...)
+TMM Memory Used          5        5       5
+Other Memory Used       97       97      97
+Swap Used               28       15      29
 ```
 
-7. Inmediatamente después, revisa las estadísticas de la interfaz:
+| Campo | ¿Qué significa? | Ejemplo real | ¿Qué anotar? |
+|---|---|---:|---|
+| `TMM Memory Used` | Memoria asignada a procesamiento de tráfico | **5 %** | Porcentaje actual |
+| `Other Memory Used` | Memoria usada fuera de TMM | **97 %** | Porcentaje actual; señalar si es alto |
+| `Swap Used` | Espacio de intercambio ocupado | **28 %** | Porcentaje actual; observar si aumenta con el tiempo |
 
-```bash
-tmsh show net interface 1.1 detail | grep -i -E "status|speed|duplex|error|drop|collision"
+En la sección `Sys::Host Memory (bytes)` también puedes consultar los tamaños:
+
+```text
+TMM:   Total 3.8G    Used 199.2M
+Other: Total 27.5G   Used 26.6G
+Total: Total 31.4G   Free 4.5G
+Swap:  Total 999.9M Used 278.7M
 ```
 
-8. **Restaura la configuración original** de la interfaz:
+**Interpretación del ejemplo:** TMM tiene poco consumo; `Other Memory Used` está en **97 %** y el swap en **28 %**. Ambos merecen seguimiento, **pero no demuestran por sí solos** que exista una fuga de memoria o degradación: es necesario investigar cachés, procesos, evolución temporal y actividad de swap.
 
-```bash
-tmsh modify net interface 1.1 media-fixed auto
+### 2.3 Disco e interfaces: buscar espacio disponible y errores — 1 min
+
+En TMSH:
+
+```text
+show sys disk
+show net interface 1.1
+show net interface 1.2
 ```
 
-9. Confirma la restauración:
+**Atención:** `show sys disk` muestra tamaños configurados de volúmenes/directorios y **no el porcentaje de espacio usado**. Para ver el espacio libre real, ejecuta desde TMSH en una sola línea:
 
-```bash
-tmsh show net interface 1.1 detail | grep -i -E "status|speed|duplex"
+```text
+run util bash -c "df -h"
 ```
 
-**Expected output:**
+En `df -h`, busca **`Use%`** y **`Avail`** para las particiones que correspondan a `/var`, `/shared` y `/config` (pueden aparecer bajo otros puntos de montaje). Registra la partición con **mayor `Use%`**; si no se distingue algún montaje, consigna el que ves, sin inventar porcentajes.
 
-- Tras forzar half-duplex, es posible observar: incremento de colisiones, errores de salida, drops o reducción de throughput en la salida de `ab` (mayor tiempo por solicitud, posibles solicitudes fallidas).
-- En entornos virtualizados (VE), el efecto puede variar: algunos hypervisores no aplican la restricción de duplex a nivel virtual. Si no se observan errores, documenta que el entorno virtual no reproduce fielmente la discrepancia de duplex y explica por qué en hardware físico el impacto sería significativo (colisiones late, CRC errors, throughput degradado).
-- Tras restaurar `auto`, el estado debe volver a `up` con speed y duplex negociados correctamente.
+En las interfaces, localiza estas columnas:
 
-**Verification:**
-
-```bash
-## Confirmar que la interfaz 1.1 está operativa y sin errores acumulados nuevos:
-tmsh show net interface 1.1 detail
-## Verificar conectividad restaurada:
-## Desde el cliente (10.10.10.10):
-curl -s -o /dev/null -w "HTTP Code: %{http_code}\n" http://10.10.10.100
-## Resultado esperado: HTTP Code: 200
+```text
+Name  Status   Bits In   Bits Out   Pkts In   Pkts Out   Drops   Errs   Media
+1.1     up       32.1M      24.4M     39.7K      43.8K        0      0   10000T-FD
+1.2     up       97.9K     126.5K       133        160        0      0   10000T-FD
 ```
 
-> **Documentación requerida:** Registra la tabla comparativa de contadores antes y después de la discrepancia de duplex. Indica si se observaron errores, drops o colisiones y correlaciona con el resultado de `ab`.
+- `Status up`: interfaz operativa.
+- `Pkts In/Out`: contadores acumulados de tráfico; deberían aumentar con nuevas solicitudes.
+- `Drops` y `Errs`: anota los valores iniciales. Lo importante es si **aumentan**, no solo que sean diferentes de cero.
+- `Media 10000T-FD`: velocidad/duplex informados; no debes modificar este ajuste.
+
+### 2.4 Estado del servicio y breve prueba — 2 min
+
+En TMSH:
+
+```text
+show ltm virtual vs_lab08_http
+show ltm pool pool_lab08 members
+```
+
+Identifica si el Virtual Server está **`available` / `enabled`**, cuántos Pool Members aparecen disponibles y el contador de conexiones **totales** (si se muestra). Las conexiones **actuales** pueden estar en cero aun cuando el servicio funcione.
+
+En **Ubuntu Bash**, genera diez solicitudes:
+
+```bash
+for i in $(seq 1 10); do curl --noproxy '*' -s -o /dev/null http://10.1.3.200:8083/; done
+```
+
+Vuelve a consultar en TMSH:
+
+```text
+show ltm virtual vs_lab08_http
+show net interface 1.1
+show net interface 1.2
+```
+
+Observa si aumentaron las conexiones **totales** o los contadores de paquetes. **No es obligatorio que CPU o memoria cambien:** diez solicitudes HTTP simples pueden ser demasiado breves para verse reflejadas en su intervalo de muestreo.
+
+### 2.5 Hoja de registro: anota solamente lo siguiente
+
+| Indicador (comando) | Ejemplo real / referencia | Tu valor inicial | Tu valor posterior (si aplica) | Interpretación breve |
+|---|---|---|---|---|
+| CPU global `Current` (`show sys cpu`) | 4 % | ____ | — | ¿Baja o elevada en esta muestra? ____ |
+| CPU individual más ocupada: `Util%` | CPU 1: 12 % | CPU __: __ % | — | ¿Un núcleo sobresale? ____ |
+| `TMM Memory Used` | 5 % | ____ % | — | ¿TMM muestra presión evidente? ____ |
+| `Other Memory Used` | 97 % | ____ % | — | ¿Requiere seguimiento? ____ |
+| `Swap Used` | 28 % | ____ % | — | ¿Dato de ocupación, no de actividad? ____ |
+| Disco: mayor `Use%` (`df -h`) | **No se obtiene de `show sys disk`** | Montaje __ / __ % | — | ¿Hay poco espacio disponible? ____ |
+| Interfaz `1.1`: `Status / Drops / Errs` | `up / 0 / 0` | ____ / ____ / ____ | ____ / ____ / ____ | ¿Aumentaron drops/errores? ____ |
+| Interfaz `1.2`: `Status / Drops / Errs` | `up / 0 / 0` | ____ / ____ / ____ | ____ / ____ / ____ | ¿Aumentaron drops/errores? ____ |
+| VS `vs_lab08_http`: estado / total de conexiones | `available` (si hay backend sano) | ____ / ____ | ____ / ____ | ¿Procesó tráfico? ____ |
+| Pool `pool_lab08`: miembros disponibles | 2 de 2 | ____ de 2 | — | ¿Servicio disponible? ____ |
+
+**Conclusión de la Etapa 2 (completa una frase):** “Mi BIG-IP muestra CPU __ %, memoria TMM __ %, Other Memory __ %, swap __ %, interfaces __, y el servicio HTTP __. El indicador que revisaría con más detalle es __ porque __”.
+
+**Criterio de logro:** identificaste correctamente los campos y registraste un valor real por indicador. No se califica que todos los porcentajes sean bajos, sino **que interpretes los datos sin confundir ocupación, actividad y disponibilidad**.
 
 ---
 
-### Paso 3: Captura de paquetes con tcpdump y análisis en Wireshark (Fase 3 — Packet Capture)
+## Etapa 3. Capturar el tráfico HTTP completo — 10 min
 
-**Objective:** Ejecutar capturas de paquetes filtradas con `tcpdump` en BIG-IP, generar tráfico controlado, transferir la captura y analizar en Wireshark el three-way handshake, retransmisiones y resets TCP.
+**Objetivo:** distinguir el flujo **cliente → Virtual Server** del flujo **BIG-IP → Pool Member**, como se practicó anteriormente con SNAT AutoMap y X-Forwarded-For.
 
-**Instructions:**
+### 3.1 Iniciar la captura (BIG-IP Bash, terminal SSH A)
 
-1. Desde la sesión SSH al BIG-IP, cambia a la shell de Bash:
+Desde TMSH:
 
-```bash
-bash
+```text
+run util bash
 ```
 
-2. Inicia una captura filtrada por la IP del Virtual Server HTTP, guardando en archivo `.pcap`:
+En Bash ejecuta **una sola línea**:
 
 ```bash
-tcpdump -ni 0.0 -s0 -c 500 -w /var/tmp/lab8_vs_http.pcap host 10.10.10.100 &
+tcpdump -nni 0.0 -s 0 -w /var/tmp/lab08_flujo.pcap 'tcp and ((host 10.1.3.4 and port 8083) or (host 10.1.2.4 and port 80) or (host 10.1.2.5 and port 80))'
 ```
 
-> **Nota:** El flag `-ni 0.0` captura en todas las interfaces lógicas de TMM (client-side y server-side). `-s0` captura el paquete completo. `-c 500` limita a 500 paquetes. El `&` ejecuta en segundo plano.
+Deja la captura en ejecución. **No elimines el filtro:** evita capturar tráfico innecesario en `0.0`.
 
-3. Anota el PID del proceso `tcpdump`:
+### 3.2 Generar las solicitudes (Ubuntu Bash)
+
+Abre otra terminal en Ubuntu:
 
 ```bash
-echo "PID de tcpdump: $!"
+for i in $(seq 1 12); do curl --noproxy '*' -s -o /dev/null "http://10.1.3.200:8083/?lab08=$i"; done
 ```
 
-4. Desde el **cliente de pruebas** (10.10.10.10), genera tráfico HTTP:
+Regresa a la captura de BIG-IP y detenla con **Ctrl+C**.
+
+### 3.3 Examinar el PCAP sin Wireshark (BIG-IP Bash)
 
 ```bash
-## Solicitudes individuales para observar handshakes claros:
-for i in $(seq 1 10); do
-  curl -s -o /dev/null -w "Request $i: HTTP %{http_code} in %{time_total}s\n" http://10.10.10.100/
-  sleep 0.5
+ls -lh /var/tmp/lab08_flujo.pcap
+tcpdump -nn -r /var/tmp/lab08_flujo.pcap | head -25
+```
+
+Para encontrar el identificador HTTP, en Bash:
+
+```bash
+tcpdump -nn -A -r /var/tmp/lab08_flujo.pcap 2>/dev/null | grep -B 8 -A 12 'lab08='
+```
+
+El parámetro `-B 8` muestra las ocho líneas **anteriores** a `lab08=` (incluida normalmente la línea IP origen → destino); `-A 12` muestra las doce **posteriores**. Si una cabecera o la línea IP queda fuera de la ventana, amplía `-B` o consulta el PCAP sin `grep`. Esta prueba solo mostrará los paquetes realmente presentes en el archivo.
+
+**Debes identificar:**
+
+- Cliente `10.1.3.4` → VIP `10.1.3.200:8083`.
+- BIG-IP `10.1.2.200` → Web01 `10.1.2.4:80` o Web02 `10.1.2.5:80`, si SNAT AutoMap se aplica al flujo.
+- Una solicitud `GET /?lab08=`. Las solicitudes `GET / HTTP/1.0` sin marcador pueden proceder de los Health Monitors.
+
+**Importante:** `tcpdump` de un flujo HTTP no cifrado permite examinar cabeceras; el `X-Forwarded-For` solo aparecerá si el perfil HTTP aplicado al VS tiene activada su inserción. El laboratorio 8 **no depende de esa cabecera**, pero se puede recordar la prueba del Laboratorio 5.
+
+**Evidencia:** anota dos pares origen/destino y explica por qué son diferentes. Opcional: descarga el PCAP y ábrelo en Wireshark para observar `tcp.flags.syn==1` y `tcp.flags.reset==1`; no es requisito.
+
+---
+
+## Etapa 4. Diagnosticar dos fallas reales y recuperarlas — 16 min
+
+**Regla:** modifica solo `mon_lab08`, `pool_lab08` y `vs_lab08_http`. No alteres el monitor HTTP predeterminado ni los objetos de laboratorios anteriores.
+
+### Caso A — El monitor declara indisponible una aplicación que sí responde (8 min)
+
+**1. Introducir la falla (BIG-IP TMSH):**
+
+```text
+modify ltm monitor http mon_lab08 recv "LAB08_CADENA_INEXISTENTE"
+```
+
+**2. Esperar al menos un ciclo de monitorización; comprobar:**
+
+```text
+show ltm pool pool_lab08 members
+show ltm virtual vs_lab08_http
+list ltm virtual vs_lab08_http connection-limit
+```
+
+Desde Ubuntu:
+
+```bash
+curl --noproxy '*' -s -o /dev/null -w 'HTTP=%{http_code} ERROR=%{errormsg}\n' --connect-timeout 3 --max-time 6 http://10.1.3.200:8083/
+```
+
+**Resultado:** los miembros pueden pasar a `offline`, por lo que el VS pierde disponibilidad. El cliente podría recibir reset, timeout u otro error; **no hay un único síntoma garantizado**.
+
+**3. Localizar la causa (BIG-IP TMSH):**
+
+```text
+list ltm monitor http mon_lab08 recv
+list ltm pool pool_lab08 monitor
+```
+
+**4. Corregir y volver a verificar:**
+
+```text
+modify ltm monitor http mon_lab08 recv none
+show ltm pool pool_lab08 members
+```
+
+Espera a que los Health Monitors vuelvan a marcar ambos miembros como disponibles. Desde Ubuntu repite el `curl` y confirma HTTP `200`.
+
+**Pregunta:** ¿por qué `Web01` puede responder HTTP 200 y simultáneamente aparecer `offline` dentro del pool?
+
+### Caso B — Un member está deshabilitado administrativamente (8 min)
+
+**1. Deshabilitar solo Web02 dentro del pool de prueba (BIG-IP TMSH):**
+
+```text
+modify ltm pool pool_lab08 members modify { 10.1.2.5:80 { session user-disabled } }
+show ltm pool pool_lab08 members
+```
+
+**2. Generar diez solicitudes desde Ubuntu:**
+
+```bash
+for i in $(seq 1 10); do curl --noproxy '*' -s http://10.1.3.200:8083/; echo; done
+```
+
+**Esperado:** normalmente todas las respuestas nuevas procederán de Web01, siempre que esté disponible y no exista persistencia. **Deshabilitar un member no equivale a apagar el servidor**: el VS puede seguir atendiendo solicitudes.
+
+**3. Recuperar y verificar (BIG-IP TMSH):**
+
+```text
+modify ltm pool pool_lab08 members modify { 10.1.2.5:80 { session user-enabled } }
+show ltm pool pool_lab08 members
+```
+
+Desde Ubuntu, repite las diez peticiones para comprobar que Web01 y Web02 vuelven a participar. No se exige alternancia exacta si hay conexiones reutilizadas.
+
+**Preguntas:** ¿qué diferencia hay entre `session user-disabled` y un member marcado `offline` por un monitor? ¿Cuál prueba describe un problema administrativo y cuál un problema de disponibilidad?
+
+---
+
+## Etapa 5. Comprobar un límite REAL de conexiones simultáneas — 7 min
+
+**Objetivo:** demostrar con conexiones reales que `connection-limit` establece un máximo de conexiones simultáneas y **no** un máximo de solicitudes acumuladas. No necesitas instalar `ab`, `nc` ni otra herramienta: solo Ubuntu Bash y TMSH. El límite se aplicará exclusivamente a `vs_lab08_http` (`10.1.3.200:8083`), sin afectar los Virtual Servers anteriores.
+
+> **Por qué se usa el límite del Virtual Server:** si limitamos únicamente Web01, BIG-IP puede enviar las conexiones adicionales a Web02 y todas las solicitudes responderían correctamente. En el VS el efecto es más sencillo de medir: todas las conexiones entrantes comparten el mismo límite. En el examen, distingue *VS connection limit*, *pool member connection limit* y *connection rate limit*.
+
+### 5.1 Verificar el valor inicial y localizar los contadores — 1 min
+
+**BIG-IP TMSH:**
+
+```text
+list ltm virtual vs_lab08_http connection-limit
+show ltm virtual vs_lab08_http
+```
+
+Busca **`connection-limit`** (normalmente `0`, sin límite) y en las estadísticas **conexiones actuales (`Current Connections`)** frente a **conexiones totales (`Total Connections`)**. Si el límite inicial no es `0`, anota su valor para restaurarlo exactamente al terminar.
+
+### 5.2 Prueba A: ocho conexiones simultáneas SIN límite — 2 min
+
+**En Ubuntu Bash, terminal A**, ejecuta este bloque. Cada proceso abre su propio socket TCP, envía una petición HTTP y mantiene abierto el descriptor durante 12 segundos:
+
+```bash
+for i in $(seq 1 8); do
+  ( exec 3<>/dev/tcp/10.1.3.200/8083 || exit
+    printf 'GET /?limite=%s HTTP/1.1\r\nHost: 10.1.3.200\r\nConnection: keep-alive\r\n\r\n' "$i" >&3
+    echo "Socket $i iniciado"
+    sleep 12
+    exec 3<&-
+    exec 3>&-
+  ) &
 done
-
-## Carga concurrente para generar volumen:
-ab -n 200 -c 20 http://10.10.10.100/
+wait
 ```
 
-5. De vuelta en BIG-IP, espera a que `tcpdump` finalice (500 paquetes) o detenlo manualmente:
+**Mientras está en ejecución**, en la terminal SSH de BIG-IP (TMSH), ejecuta inmediatamente:
+
+```text
+show ltm virtual vs_lab08_http
+show sys connection cs-server-addr 10.1.3.200 cs-server-port 8083
+```
+
+**Observa:** el número de conexiones del lado cliente y el contador de conexiones actuales. Una solicitud `GET` puede terminar aunque el socket siga abierto; por ello registra lo que realmente muestre BIG-IP, no supongas que los ocho sockets permanecerán activos los 12 segundos. Es posible que el backend o el perfil TCP/HTTP cierre antes algunas conexiones.
+
+### 5.3 Prueba B: limitar el Virtual Server a dos conexiones — 2 min
+
+**En BIG-IP TMSH:**
+
+```text
+modify ltm virtual vs_lab08_http connection-limit 2
+list ltm virtual vs_lab08_http connection-limit
+```
+
+**Repite el mismo bloque de ocho sockets** de la prueba A desde Ubuntu. Mientras se ejecuta, observa de nuevo en BIG-IP:
+
+```text
+show ltm virtual vs_lab08_http
+show sys connection cs-server-addr 10.1.3.200 cs-server-port 8083
+```
+
+**Compara A frente a B:** el límite configurado es `2`. BIG-IP no debe admitir más conexiones concurrentes de las permitidas para ese VS; las conexiones excedentes pueden rechazarse, permanecer pendientes o experimentar un timeout, según el procesamiento TCP y el momento exacto de medición. Que Bash imprima «Socket iniciado» **no confirma por sí solo que la petición HTTP haya sido procesada**. La evidencia decisiva es la combinación de estadísticas del VS, tabla de conexiones y comportamiento de las solicitudes. <u>No se exige un número fijo de errores.</u>
+
+| Evidencia que debes anotar | Prueba A: sin límite | Prueba B: límite 2 |
+|---|---|---|
+| `connection-limit` configurado | ____ | `2` |
+| Máximo de `Current Connections` observado | ____ | ____ |
+| Entradas client-side visibles en `show sys connection` | ____ | ____ |
+| ¿Hubo conexiones rechazadas, pendientes o cerradas? | ____ | ____ |
+| ¿Se incrementó `Total Connections`? | ____ | ____ |
+
+**Si las conexiones se cierran tan rápido que no puedes contar ninguna:** repite la prueba mientras observas inmediatamente las estadísticas; toma como resultado válido la configuración del límite y explica que un HTTP `GET` breve no garantiza conexiones concurrentes persistentes. **No inventes un rechazo que no ocurrió.**
+
+### 5.4 Restaurar la configuración y comprobar HTTP — 2 min
+
+**En BIG-IP TMSH**, vuelve al valor inicial (si era `0`):
+
+```text
+modify ltm virtual vs_lab08_http connection-limit 0
+list ltm virtual vs_lab08_http connection-limit
+```
+
+**En Ubuntu Bash:**
 
 ```bash
-## Si aún está ejecutándose:
-kill %1 2>/dev/null
-## Verificar que el archivo existe y tiene contenido:
-ls -lh /var/tmp/lab8_vs_http.pcap
+curl --noproxy '*' -s -o /dev/null -w 'HTTP=%{http_code}\n' http://10.1.3.200:8083/
 ```
 
-6. **Captura adicional para provocar resets TCP:** Inicia una segunda captura y genera solicitudes hacia un puerto cerrado o un pool member que no responde:
+**Esperado:** `HTTP=200`; `connection-limit 0` significa **sin límite explícito configurado**. Si el valor inicial era distinto de `0`, restaura ese valor en lugar de `0`.
 
-```bash
-tcpdump -ni 0.0 -s0 -c 100 -w /var/tmp/lab8_resets.pcap host 10.10.10.100 &
-```
+**Responde:**
 
-7. Desde el cliente, intenta una conexión que genere un reset (por ejemplo, si temporalmente deshabilitamos un member):
+1. ¿Por qué enviar 100 solicitudes secuenciales no demuestra un límite de 2 conexiones simultáneas?
+2. ¿Por qué limitar solo Web01 no garantiza errores si Web02 sigue disponible?
+3. ¿Qué diferencia existe entre `connection-limit 2` y una limitación de dos conexiones *por segundo*?
 
-```bash
-## En BIG-IP tmsh (abrir otra sesión SSH):
-tmsh modify ltm node 10.20.20.12 session user-disabled
-```
-
-8. Genera tráfico desde el cliente:
-
-```bash
-## Desde el cliente (10.10.10.10):
-for i in $(seq 1 20); do
-  curl -s -o /dev/null -w "Request $i: HTTP %{http_code}\n" http://10.10.10.100/
-done
-```
-
-9. Detén la captura y rehabilita el nodo:
-
-```bash
-## En BIG-IP bash:
-kill %1 2>/dev/null
-
-## Rehabilitar el nodo:
-exit  # volver a tmsh
-tmsh modify ltm node 10.20.20.12 session user-enabled
-```
-
-10. Verifica los archivos de captura:
-
-```bash
-bash
-ls -lh /var/tmp/lab8_*.pcap
-```
-
-11. **Transfiere las capturas** al cliente de administración usando SCP. Desde la estación de trabajo (192.0.2.10):
-
-```bash
-scp admin@192.0.2.245:/var/tmp/lab8_vs_http.pcap ./
-scp admin@192.0.2.245:/var/tmp/lab8_resets.pcap ./
-```
-
-12. **Abre `lab8_vs_http.pcap` en Wireshark 4.2.3** y realiza los siguientes análisis:
-
-    a. **Three-way handshake:** Aplica el filtro `tcp.flags.syn==1` y localiza pares SYN / SYN-ACK. Verifica que cada conexión completa el handshake (SYN → SYN-ACK → ACK).
-
-    b. **Retransmisiones TCP:** Aplica el filtro `tcp.analysis.retransmission`. Documenta cuántas retransmisiones se observan y entre qué endpoints ocurren.
-
-    c. **Flujo client-side vs. server-side:** En la captura de interfaz `0.0`, observa que aparecen dos flujos por cada conexión HTTP: uno entre el cliente (10.10.10.10) y el VIP (10.10.10.100), y otro entre el Self IP interno (10.20.20.245) y el pool member (10.20.20.11 o 10.20.20.12).
-
-13. **Abre `lab8_resets.pcap` en Wireshark** y aplica el filtro `tcp.flags.reset==1`. Documenta:
-    - ¿Qué endpoint envía el RST?
-    - ¿En qué momento del flujo TCP ocurre (después del SYN, después de datos, etc.)?
-    - ¿Correlaciona con el member deshabilitado?
-
-**Expected output:**
-
-- `lab8_vs_http.pcap`: Archivo de 50 KB–2 MB con ~500 paquetes. En Wireshark se observan handshakes completos, solicitudes HTTP GET y respuestas 200 OK.
-- `lab8_resets.pcap`: Archivo con paquetes que incluyen RST flags. Cuando un pool member está deshabilitado y solo queda uno activo, todo el tráfico se dirige al member restante. Si ambos estuvieran down, se observarían resets del BIG-IP al cliente.
-- Las retransmisiones en condiciones normales de laboratorio deben ser mínimas (0-2).
-
-**Verification:**
-
-```bash
-## En BIG-IP, confirmar que ambos members están activos nuevamente:
-tmsh show ltm pool pool_http members
-
-## Desde el cliente, confirmar servicio operativo:
-curl -s -o /dev/null -w "HTTP Code: %{http_code}\n" http://10.10.10.100
-## Resultado esperado: HTTP Code: 200
-```
-
-> **Documentación requerida:** Registra: (1) Capturas de pantalla de Wireshark mostrando el three-way handshake, (2) Número de retransmisiones encontradas, (3) Análisis de RST flags con endpoint origen y momento del flujo, (4) Observación de los dos flujos (client-side y server-side) en la captura de interfaz `0.0`.
+**Criterio de éxito:** configuraste el límite, generaste conexiones concurrentes con herramientas existentes, observaste los contadores y recuperaste el funcionamiento del servicio. La evidencia y su interpretación importan más que provocar un error concreto.
 
 ---
 
-### Paso 4: Troubleshooting de Virtual Servers y Pools — escenarios de falla (Fase 4)
+## Etapa 6. Generar QKView, validar y limpiar — 10 min
 
-**Objective:** Diagnosticar tres escenarios de falla simulados en Virtual Servers y Pools utilizando `tmsh` y la GUI, correlacionando configured state, availability state, Health Monitors, connection limits y perfiles TCP.
+### 6.1 Generar diagnóstico (BIG-IP Bash)
 
-**Instructions:**
+Desde TMSH, entra a Bash:
 
-#### Escenario A: Health Monitor con configuración incorrecta
-
-1. Modifica el Health Monitor HTTP del pool para que espere una cadena de respuesta que el servidor no devuelve:
-
-```bash
-tmsh modify ltm monitor http http_monitor send "GET /nonexistent_health_page HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" recv "EXPECTED_STRING_THAT_DOES_NOT_EXIST"
+```text
+run util bash
 ```
 
-> **Nota:** Si tu monitor tiene un nombre diferente, sustitúyelo. Verifica el nombre actual con `tmsh list ltm pool pool_http monitor`.
-
-2. Espera 30 segundos (o el intervalo + timeout del monitor) y verifica el estado:
+Genera un archivo QKView (puede tomar varios minutos):
 
 ```bash
-tmsh show ltm pool pool_http
-tmsh show ltm pool pool_http members
-tmsh show ltm virtual vs_http
+qkview -f /var/tmp/lab08.qkview
 ```
 
-3. Documenta:
-   - ¿Cuál es el `Availability` del pool y de cada member?
-   - ¿Cuál es el estado del Virtual Server?
-   - ¿Qué indica el campo `Monitor` de cada member?
-
-4. Prueba desde el cliente:
+Comprueba su existencia:
 
 ```bash
-## Desde el cliente (10.10.10.10):
-curl -v http://10.10.10.100/
+ls -lh /var/tmp/lab08.qkview
 ```
 
-5. Documenta el comportamiento observado (timeout, reset, error específico).
+Si el comando muestra una ruta de salida distinta, **usa la que muestre el propio sistema**. No se exige un tamaño fijo: varía por versión, módulos y logs. No abras ni publiques el contenido del QKView: puede contener información sensible.
 
-6. **Corrección:** Restaura el monitor a una configuración funcional:
+**iHealth:** el estudiante debe saber que un QKView puede cargarse en <https://ihealth.f5.com/> para obtener diagnósticos; la carga no es obligatoria porque requiere cuenta y procesamiento externo. La práctica obligatoria es **generar y localizar** el archivo.
+
+### 6.2 Inspeccionar los últimos eventos (BIG-IP Bash)
 
 ```bash
-tmsh modify ltm monitor http http_monitor send "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" recv ""
+tail -20 /var/log/ltm
 ```
 
-7. Espera 30 segundos y verifica la recuperación:
+Busca eventos de health monitor y cambios en la disponibilidad del pool. **No confundas un evento histórico con una falla que continúa activa.** Regresa a TMSH con `exit`.
 
-```bash
-tmsh show ltm pool pool_http members
+### 6.3 Validar estado final (BIG-IP TMSH)
+
+```text
+show ltm pool pool_lab08 members
+list ltm pool pool_lab08 members
+show ltm virtual vs_lab08_http
+list ltm virtual vs_lab08_http connection-limit
 ```
 
-#### Escenario B: Connection limit alcanzado en un pool member
-
-8. Configura un límite de conexiones extremadamente bajo en un member:
+Desde Ubuntu:
 
 ```bash
-tmsh modify ltm pool pool_http members modify { 10.20.20.11:80 { connection-limit 1 } }
+curl --noproxy '*' -s -w '\nHTTP=%{http_code}\n' http://10.1.3.200:8083/
 ```
 
-9. Genera carga concurrente desde el cliente:
+**Esperado:** HTTP `200`, los dos members `available`, `connection-limit` del VS restaurado a su valor inicial, sin `user-disabled`, con el monitor recuperado.
 
-```bash
-## Desde el cliente (10.10.10.10):
-ab -n 100 -c 20 http://10.10.10.100/
+### 6.4 Limpiar solo objetos del Lab 8 (BIG-IP TMSH)
+
+Una vez registrada la evidencia, elimina el servicio temporal **en este orden**:
+
+```text
+delete ltm virtual vs_lab08_http
+delete ltm pool pool_lab08
+delete ltm monitor http mon_lab08
+save sys config
 ```
 
-10. Durante o inmediatamente después de la carga, verifica las estadísticas:
+Para evitar llenar el disco, puedes eliminar las capturas y el QKView en **BIG-IP Bash** después de anotar el resultado:
 
-```bash
-tmsh show ltm pool pool_http members
-tmsh show ltm pool pool_http members field-fmt | grep -A5 "10.20.20.11"
+```text
+run util bash
 ```
 
-11. Documenta:
-    - ¿Cuántas conexiones actuales tiene cada member?
-    - ¿El member con `connection-limit 1` muestra estado diferente?
-    - ¿Se observa distribución asimétrica del tráfico?
-
-12. **Corrección:** Elimina el límite de conexiones:
-
 ```bash
-tmsh modify ltm pool pool_http members modify { 10.20.20.11:80 { connection-limit 0 } }
+rm -f /var/tmp/lab08_flujo.pcap /var/tmp/lab08.qkview
 ```
 
-#### Escenario C: Virtual Server con perfil TCP incompatible
-
-13. Crea un perfil TCP personalizado con un valor de `idle-timeout` extremadamente bajo para simular desconexiones prematuras:
-
 ```bash
-tmsh create ltm profile tcp tcp_lab8_broken idle-timeout 1 defaults-from tcp
-```
-
-14. Aplica el perfil al Virtual Server:
-
-```bash
-tmsh modify ltm virtual vs_http profiles delete { tcp }
-tmsh modify ltm virtual vs_http profiles add { tcp_lab8_broken { context all } }
-```
-
-15. Genera solicitudes desde el cliente con una pausa deliberada:
-
-```bash
-## Desde el cliente (10.10.10.10):
-## Solicitud con tiempo de respuesta esperado normal:
-curl -v --max-time 10 http://10.10.10.100/
-
-## Solicitud que simula un cliente lento (espera 3 segundos antes de enviar):
-(sleep 3 && echo -e "GET / HTTP/1.1\r\nHost: 10.10.10.100\r\nConnection: close\r\n\r\n") | nc -w 5 10.10.10.100 80
-```
-
-16. Verifica las estadísticas del Virtual Server:
-
-```bash
-tmsh show ltm virtual vs_http
-```
-
-17. Documenta si se observan resets o conexiones cerradas prematuramente.
-
-18. **Corrección:** Restaura el perfil TCP original:
-
-```bash
-tmsh modify ltm virtual vs_http profiles delete { tcp_lab8_broken }
-tmsh modify ltm virtual vs_http profiles add { tcp { context all } }
-tmsh delete ltm profile tcp tcp_lab8_broken
-```
-
-**Expected output:**
-
-- **Escenario A:** Pool members marcados como `offline` (círculo rojo) o `unknown`. El Virtual Server pasa a estado `offline` o `unavailable`. El cliente recibe un reset de conexión o un error de timeout.
-- **Escenario B:** El member con `connection-limit 1` alcanza su límite rápidamente; el tráfico se redistribuye al otro member. Las estadísticas muestran distribución desigual.
-- **Escenario C:** Con `idle-timeout 1`, conexiones que tarden más de 1 segundo en completarse son terminadas por BIG-IP. Se observan resets o cierres de conexión en solicitudes lentas.
-
-**Verification:**
-
-```bash
-## Confirmar que todos los escenarios están corregidos:
-tmsh show ltm virtual vs_http
-## Availability: available (verde)
-
-tmsh show ltm pool pool_http members
-## Ambos members: available, connection-limit 0
-
-tmsh list ltm virtual vs_http profiles
-## Debe mostrar perfil tcp (no tcp_lab8_broken)
-
-## Prueba funcional final:
-## Desde el cliente (10.10.10.10):
-ab -n 50 -c 5 http://10.10.10.100/
-## 100% de solicitudes exitosas
-```
-
-> **Documentación requerida:** Para cada escenario registra: (1) Comando de inyección de falla, (2) Salida de `tmsh show` mostrando el estado degradado, (3) Comportamiento observado desde el cliente, (4) Comando de corrección, (5) Confirmación de recuperación.
-
----
-
-### Paso 5: Estadísticas de tráfico y análisis de flujo (Fase 5)
-
-**Objective:** Revisar estadísticas de tráfico por objeto (Virtual Server, Pool, Node) en la GUI y CLI, y verificar la configuración de SNMP para monitoreo externo.
-
-**Instructions:**
-
-1. Genera una carga sostenida de 60 segundos desde el cliente:
-
-```bash
-## Desde el cliente (10.10.10.10):
-ab -n 2000 -c 30 -t 60 http://10.10.10.100/
-```
-
-2. **Durante la ejecución de `ab`**, accede a la GUI de BIG-IP:
-   - Navega a **Statistics > Module Statistics > Local Traffic**.
-   - Selecciona **Virtual Servers** en el menú desplegable `Statistics Type`.
-   - Observa y documenta para `vs_http`: Bits In, Bits Out, Packets In, Packets Out, Current Connections, Total Connections.
-
-3. Cambia la vista a **Pools** y documenta las mismas métricas para `pool_http`.
-
-4. Cambia a **Nodes** y verifica la distribución de tráfico entre `10.20.20.11` y `10.20.20.12`.
-
-5. Navega a **Statistics > Performance > System** y observa las gráficas de CPU y throughput durante el periodo de carga. Captura una imagen.
-
-6. Desde `tmsh`, obtén estadísticas en tiempo real:
-
-```bash
-## Estadísticas del Virtual Server:
-tmsh show ltm virtual vs_http raw
-
-## Estadísticas del Pool:
-tmsh show ltm pool pool_http all-properties
-
-## Estadísticas por Node:
-tmsh show ltm node 10.20.20.11
-tmsh show ltm node 10.20.20.12
-```
-
-7. **Verificación de SNMP:** Consulta la configuración actual de SNMP:
-
-```bash
-tmsh list sys snmp
-tmsh list sys snmp communities
-tmsh list sys snmp allowed-addresses
-```
-
-8. Si no existe una comunidad configurada, crea una de solo lectura para verificación:
-
-```bash
-tmsh modify sys snmp communities add { lab8_community { community-name lab8ro access ro } }
-tmsh modify sys snmp allowed-addresses add { 192.0.2.0/24 }
-```
-
-9. Verifica la configuración SNMP resultante:
-
-```bash
-tmsh list sys snmp communities
-```
-
-10. Elimina la comunidad de prueba al finalizar:
-
-```bash
-tmsh modify sys snmp communities delete { lab8_community }
-```
-
-**Expected output:**
-
-- Las estadísticas del Virtual Server muestran incremento proporcional de conexiones y bytes durante la carga de `ab`.
-- La distribución entre los dos pool members debe ser aproximadamente equitativa (Round Robin o el método de balanceo configurado).
-- Las gráficas de Performance muestran un pico de CPU y throughput coincidente con el periodo de `ab`.
-- La configuración SNMP muestra las comunidades y direcciones permitidas.
-
-**Verification:**
-
-```bash
-## Confirmar que las estadísticas del Virtual Server reflejan tráfico procesado:
-tmsh show ltm virtual vs_http | grep -i "total"
-## Debe mostrar Total Requests > 0
-
-## Confirmar distribución entre members:
-tmsh show ltm pool pool_http members | grep -A2 "10.20.20"
-## Ambos members deben mostrar Total Requests > 0
-```
-
-> **Documentación requerida:** Registra: (1) Tabla de estadísticas por objeto, (2) Captura de pantalla de gráfica de Performance durante la carga, (3) Distribución porcentual de tráfico entre members, (4) Configuración SNMP verificada.
-
----
-
-### Paso 6: Generación de QKView y análisis en iHealth (Fase 6)
-
-**Objective:** Generar un QKView del sistema, descargarlo, cargarlo en F5 iHealth y revisar los diagnósticos automatizados para documentar la evidencia consolidada.
-
-**Instructions:**
-
-1. Desde la shell de Bash en BIG-IP, genera el QKView:
-
-```bash
-bash
-qkview -f /var/tmp/lab8_qkview.tar.gz
-```
-
-> **Nota:** La generación puede tardar 2-5 minutos dependiendo de los recursos del laboratorio. No interrumpas el proceso.
-
-2. Verifica que el archivo se generó correctamente:
-
-```bash
-ls -lh /var/tmp/lab8_qkview.tar.gz
-## Tamaño esperado: 10-50 MB típicamente
-```
-
-3. Transfiere el QKView al cliente de administración:
-
-```bash
-## Desde la estación de trabajo (192.0.2.10):
-scp admin@192.0.2.245:/var/tmp/lab8_qkview.tar.gz ./
-```
-
-4. Accede a [F5 iHealth](https://ihealth.f5.com/) con tu cuenta MyF5 (o las credenciales de demostración provistas por el instructor).
-
-5. Sube el archivo `lab8_qkview.tar.gz`:
-   - Haz clic en **Upload** o **New QKView**.
-   - Selecciona el archivo y espera a que se procese (1-5 minutos).
-
-6. Una vez procesado, revisa las siguientes secciones del informe de iHealth:
-
-   a. **Diagnostics:** Identifica advertencias y errores. Documenta cada hallazgo con su severidad (Critical, High, Medium, Low, Informational).
-
-   b. **Software:** Verifica la versión detectada (debe ser 17.1.2) y si iHealth reporta vulnerabilidades conocidas o actualizaciones recomendadas.
-
-   c. **Hardware/Platform:** Confirma que iHealth identifica correctamente la plataforma como Virtual Edition.
-
-   d. **Configuration:** Revisa si hay recomendaciones de configuración (por ejemplo, NTP no configurado, DNS faltante, etc.).
-
-7. Documenta al menos **tres hallazgos** del informe de iHealth en tu plantilla con el siguiente formato:
-
-| # | Severidad | Categoría | Descripción | Recomendación de iHealth | Acción propuesta |
-|---|---|---|---|---|---|
-| 1 | | | | | |
-| 2 | | | | | |
-| 3 | | | | | |
-
-8. Si no dispones de acceso a iHealth, como alternativa documenta el contenido del QKView localmente:
-
-```bash
-## En BIG-IP bash, listar el contenido del QKView:
-tar tzf /var/tmp/lab8_qkview.tar.gz | head -30
-
-## Revisar el archivo de diagnóstico incluido:
-tar xzf /var/tmp/lab8_qkview.tar.gz -C /var/tmp/qkview_extract/ 2>/dev/null
-ls /var/tmp/qkview_extract/
-```
-
-**Expected output:**
-
-- QKView generado exitosamente con tamaño entre 10-50 MB.
-- iHealth procesa el archivo y muestra un dashboard con diagnósticos categorizados.
-- En un entorno de laboratorio, es común encontrar advertencias de severidad baja o media relacionadas con: NTP no configurado, licencia de evaluación, configuraciones por defecto no optimizadas.
-
-**Verification:**
-
-```bash
-## Confirmar que el QKView existe y es transferible:
-ls -lh /var/tmp/lab8_qkview.tar.gz
-## Tamaño > 5 MB indica generación exitosa
-
-## Verificar integridad del archivo:
-file /var/tmp/lab8_qkview.tar.gz
-## Resultado esperado: gzip compressed data
-```
-
-> **Documentación requerida:** Registra: (1) Tamaño y fecha del QKView, (2) Captura de pantalla del dashboard de iHealth (o listado de contenido si no hay acceso), (3) Tabla con mínimo 3 hallazgos documentados, (4) Versión de BIG-IP confirmada por iHealth.
-
----
-
-## Validación y Pruebas
-
-Completa las siguientes verificaciones para confirmar que el laboratorio se ha ejecutado correctamente y que la evidencia es suficiente:
-
-### Verificación funcional completa
-
-```bash
-## 1. Confirmar que el entorno está restaurado a su estado operativo:
-tmsh show ltm virtual vs_http
-## Availability: available, State: enabled
-
-tmsh show ltm pool pool_http members
-## Ambos members: available, State: enabled, connection-limit: 0
-
-## 2. Verificar que no quedan artefactos de los escenarios de falla:
-tmsh list ltm profile tcp tcp_lab8_broken 2>&1
-## Resultado esperado: "was not found" (el perfil fue eliminado)
-
-## 3. Confirmar conectividad end-to-end:
-## Desde el cliente (10.10.10.10):
-curl -s -o /dev/null -w "HTTP: %{http_code} | Total: %{time_total}s\n" http://10.10.10.100
-## HTTP: 200 | Total: < 1s
-
-## 4. Verificar que las interfaces están limpias:
-tmsh show net interface 1.1 | grep -i "media-active"
-## Debe mostrar auto-negotiated, no half-duplex
-
-## 5. Confirmar que los archivos de captura existen:
-bash
-ls -lh /var/tmp/lab8_vs_http.pcap /var/tmp/lab8_resets.pcap /var/tmp/lab8_qkview.tar.gz
 exit
 ```
 
-### Verificación de evidencia documentada
+**No borres archivos UCS ni perfiles, pools o VS creados en otros laboratorios.**
 
-Confirma que tu plantilla de troubleshooting contiene:
+---
 
-| # | Evidencia | Fase | ¿Completa? |
-|---|---|---|---|
-| 1 | Línea base de CPU, memoria, disco, interfaces | Fase 1 | ☐ |
-| 2 | Tabla comparativa de contadores de interfaz (antes/después de discrepancia duplex) | Fase 2 | ☐ |
-| 3 | Capturas de pantalla de Wireshark: three-way handshake, retransmisiones, resets | Fase 3 | ☐ |
-| 4 | Diagnóstico documentado de 3 escenarios de falla (A, B, C) con causa y corrección | Fase 4 | ☐ |
-| 5 | Estadísticas de tráfico por objeto y distribución entre members | Fase 5 | ☐ |
-| 6 | Hallazgos de iHealth (mínimo 3) con severidad y acción propuesta | Fase 6 | ☐ |
+## Hoja de evidencias y criterios de aprobación
 
-### Caso adversarial: validación de información contradictoria
+| Competencia | Evidencia mínima | Hecho |
+|---|---|---|
+| Crear y validar servicio LTM independiente | HTTP 200 en `:8083` y dos members `available` | ☐ |
+| Línea base | CPU, memoria, disco, errores/drops de interfaces | ☐ |
+| Flujo de datos | PCAP con dos lados del flujo y una petición marcada | ☐ |
+| Health Monitor | Evidencia de member down, causa y corrección | ☐ |
+| Control administrativo | Member deshabilitado/habilitado y efecto en tráfico | ☐ |
+| Rendimiento | Pruebas A/B de conexiones simultáneas, límite del VS en 2 y restauración | ☐ |
+| Diagnóstico | QKView creado, logs consultados y entorno limpio | ☐ |
 
-Para verificar el rigor del diagnóstico, responde la siguiente pregunta en tu documentación:
+**Cierre técnico (responder en una o dos líneas cada uno):**
 
-> **Pregunta adversarial:** Un compañero afirma que el Virtual Server `vs_http` tiene un problema de rendimiento porque la CPU de TMM está al 95%. Sin embargo, al revisar `tmsh show sys cpu`, observas que la CPU promedio es del 12% y ningún núcleo individual supera el 20%. El compañero insiste porque vio el valor "95" en una pantalla de la GUI. ¿Qué explicación darías y qué evidencia adicional solicitarías antes de aceptar ese diagnóstico?
+1. Si Web01 responde por HTTP directamente, pero el pool lo muestra `offline`, ¿qué revisarías primero?
+2. Si un Virtual Server recibe conexiones, pero los members no muestran actividad, ¿cuáles son tres comprobaciones prioritarias?
+3. ¿Por qué `10.1.3.4 → 10.1.3.200:8083` y `10.1.2.200 → 10.1.2.4:80` son dos conexiones diferentes?
+4. ¿Cuál es la diferencia entre `configured state` y `availability state`?
+5. ¿Qué aporta un QKView y qué no puede sustituir?
 
-**Respuesta esperada (criterios de evaluación):**
-- Identificar que el valor "95" podría corresponder a una métrica diferente (por ejemplo, porcentaje de utilización de un recurso específico, un pico histórico, o una lectura de un periodo de muestreo diferente).
-- Solicitar la captura de pantalla exacta con la ruta de navegación en la GUI.
-- Correlacionar con `tmsh show sys cpu` y `tmsh show sys performance` para obtener datos objetivos.
-- No aceptar un diagnóstico basado en una sola métrica sin contexto temporal ni correlación con síntomas observables.
+## Solucionario
 
-## Solución de Problemas
+1. **Member offline pese a HTTP 200:** examinar el monitor asociado, `send`/`recv`, puerto, intervalo/timeout y respuesta real. Un monitor con `recv` incorrecto puede marcar `offline` un backend sano.
+2. **VS con conexiones, members sin actividad:** confirmar pool realmente asociado al VS, estado/monitor de los miembros y perfiles o políticas que afecten la selección; verificar tabla de conexiones y captura de ambos lados para determinar si BIG-IP abre la conexión al servidor.
+3. **Dos conexiones:** BIG-IP LTM Standard opera como **Full Proxy**, con lado cliente y lado servidor. SNAT AutoMap puede usar `10.1.2.200` como origen de la conexión al backend.
+4. **Configurado vs. disponible:** la configuración administrativa (`enabled`, `disabled`, `user-disabled`) no equivale al estado observado por monitores o accesibilidad (`available`, `offline`, `unknown`).
+5. **QKView:** reúne configuración, estadísticas y registros para diagnóstico, soporte y análisis en iHealth; **no corrige automáticamente** la falla ni sustituye pruebas de conectividad, capturas y validaciones.
+6. **Caso A:** `recv "LAB08_CADENA_INEXISTENTE"` no coincide con la respuesta de Apache; restaurar `recv none` permite que el monitor HTTP predeterminado considere correcta una respuesta adecuada según sus criterios.
+7. **Caso B:** `user-disabled` evita nuevas selecciones del member dentro de ese pool; al habilitarlo otra vez puede volver a ser seleccionado. El estado de monitor es un criterio separado.
+8. **Límite de conexiones (Etapa 5):** `connection-limit 2` en el Virtual Server limita las conexiones simultáneas del VS; `0` elimina el límite explícito. Los contadores `Current Connections` muestran actividad puntual y `Total Connections` acumula conexiones históricas. Una secuencia de 100 solicitudes no demuestra simultaneidad. Si se limita solo Web01, Web02 puede seguir recibiendo conexiones. El límite de conexiones simultáneas no es equivalente a un *connection rate limit*, que controla la tasa de conexiones nuevas por unidad de tiempo. La presencia de `Socket iniciado` en Bash no garantiza que BIG-IP completó el HTTP.
+9. **Drops/errores:** un contador acumulado no demuestra degradación actual; hay que medir su variación y correlacionarla con síntomas.
 
-### Problema 1: tcpdump no captura paquetes del Virtual Server
+## Diagnóstico rápido
 
-**Síntomas:** Se ejecuta `tcpdump -ni 0.0 host 10.10.10.100` pero no aparecen paquetes, a pesar de que el cliente está generando tráfico y recibiendo respuestas HTTP 200.
-
-**Causa:** El comando `tcpdump` se ejecutó desde `tmsh` en lugar de desde la shell de `bash`. En `tmsh`, `tcpdump` no está disponible como comando directo, o se ejecutó con la interfaz incorrecta (por ejemplo, `eth0` en lugar de `0.0`). La interfaz especial `0.0` en BIG-IP captura tráfico en todas las interfaces lógicas de TMM y solo está disponible desde la shell de Bash. Si se usa `eth0` o `mgmt`, solo se captura tráfico de la red de gestión.
-
-**Solución:**
-
-```bash
-## 1. Confirmar que estás en bash (no en tmsh):
-whoami
-## Debe mostrar: root (después de sudo bash) o admin
-
-## 2. Si estás en tmsh, cambiar a bash:
-bash
-
-## 3. Ejecutar tcpdump con la interfaz correcta:
-tcpdump -ni 0.0 -s0 -c 10 host 10.10.10.100
-
-## 4. Si necesitas ejecutar como root:
-sudo tcpdump -ni 0.0 -s0 -c 10 host 10.10.10.100
-
-## 5. Verificar que hay tráfico activo generándose desde el cliente:
-## Desde otra terminal en el cliente (10.10.10.10):
-curl http://10.10.10.100/
-```
-
-### Problema 2: Pool members marcados como down después de restaurar el Health Monitor
-
-**Síntomas:** Después de ejecutar el Escenario A (Paso 4) y restaurar el monitor HTTP con `recv ""`, los pool members permanecen en estado `offline` (rojo) durante más de 60 segundos. El Virtual Server sigue no disponible.
-
-**Causa:** El nombre del monitor modificado no coincide con el monitor realmente asignado al pool. Es posible que el pool utilice un monitor con nombre diferente (por ejemplo, `http` predeterminado del sistema vs. `http_monitor` personalizado). Al modificar un monitor que no es el asignado, el monitor real del pool puede haber quedado con una configuración incompatible, o el pool puede tener un monitor adicional que está fallando.
-
-**Solución:**
-
-```bash
-## 1. Identificar el monitor exacto asignado al pool:
-tmsh list ltm pool pool_http monitor
-## Ejemplo de salida: monitor http
-
-## 2. Si el monitor asignado es "http" (predeterminado del sistema), NO se puede
-## modificar directamente. Verificar si fue modificado por error:
-tmsh list ltm monitor http http
-
-## 3. Si el monitor predeterminado fue alterado, restaurar los valores por defecto:
-tmsh modify ltm monitor http http send "GET /\r\n" recv ""
-
-## 4. Si el pool usa un monitor personalizado, verificar su configuración:
-tmsh list ltm monitor http http_monitor
-
-## 5. Forzar una reevaluación reiniciando el monitor en el pool:
-tmsh modify ltm pool pool_http monitor none
-tmsh modify ltm pool pool_http monitor http
-
-## 6. Esperar el intervalo del monitor (por defecto 5 segundos) + timeout (16 segundos)
-## y verificar:
-sleep 20
-tmsh show ltm pool pool_http members
-## Ambos members deben mostrar: State: up, Monitor: up
-```
-
-## Limpieza
-
-Ejecuta los siguientes comandos para restaurar el entorno a su estado previo al laboratorio:
-
-```bash
-## 1. Eliminar archivos de captura y QKView generados:
-bash
-rm -f /var/tmp/lab8_vs_http.pcap
-rm -f /var/tmp/lab8_resets.pcap
-rm -f /var/tmp/lab8_qkview.tar.gz
-rm -rf /var/tmp/qkview_extract/
-rm -f /var/tmp/if11_backup.txt
-exit
-
-## 2. Confirmar que no quedan perfiles de prueba:
-tmsh list ltm profile tcp tcp_lab8_broken 2>&1
-## Debe indicar "not found"
-
-## 3. Confirmar que la interfaz 1.1 está en auto-negotiate:
-tmsh list net interface 1.1 media-fixed
-## Debe mostrar: media-fixed auto
-
-## 4. Confirmar que connection-limit está en 0 para ambos members:
-tmsh show ltm pool pool_http members | grep "connection-limit"
-## Ambos deben mostrar: 0
-
-## 5. Eliminar la comunidad SNMP de prueba si no fue eliminada:
-tmsh modify sys snmp communities delete { lab8_community } 2>/dev/null
-
-## 6. Confirmar que el Health Monitor está funcional:
-tmsh show ltm pool pool_http members
-## Ambos members: available
-
-## 7. Guardar la configuración limpia:
-tmsh save sys config
-
-## 8. Verificación final end-to-end:
-## Desde el cliente (10.10.10.10):
-curl -s -o /dev/null -w "HTTP: %{http_code}\n" http://10.10.10.100
-## HTTP: 200
-```
-
-## Resumen
-
-En este laboratorio se aplicó una metodología de diagnóstico de rendimiento y red en BIG-IP VE 17.1.2 a través de seis fases progresivas:
-
-1. **Línea base de recursos:** Se recopilaron métricas de CPU, memoria, disco e interfaces como referencia para comparación durante incidentes, diferenciando indicadores del Control Plane (procesos administrativos) y Data Plane (TMM).
-
-2. **Análisis de interfaces:** Se examinaron contadores de errores, drops, speed y duplex, comprobando que una discrepancia de duplex produce degradación observable en las estadísticas.
-
-3. **Captura de paquetes:** Se ejecutaron capturas filtradas con `tcpdump` en la interfaz `0.0`, se identificaron los flujos client-side y server-side, y se analizaron en Wireshark handshakes TCP, retransmisiones y resets.
-
-4. **Escenarios de falla:** Se diagnosticaron tres condiciones controladas — monitor con recv incorrecto, connection limit alcanzado y perfil TCP con idle-timeout agresivo — correlacionando configured state vs. availability state.
-
-5. **Estadísticas de tráfico:** Se verificó la distribución de carga entre pool members y se revisó la configuración de SNMP para monitoreo externo.
-
-6. **QKView e iHealth:** Se generó un snapshot de diagnóstico del sistema y se analizaron los hallazgos automatizados para documentar evidencia consolidada.
-
-**Principio clave:** Una métrica aislada no constituye un diagnóstico. La correlación entre utilización de recursos, estadísticas de interfaces, capturas de paquetes y estados de objetos es lo que permite identificar y sustentar la causa raíz de un problema de rendimiento.
-
-### Recursos adicionales
-
-| Recurso | URL |
+| Problema | Revisión |
 |---|---|
-| F5 BIG-IP TMOS Operations Guide | [https://techdocs.f5.com/en-us/bigip-17-1-0.html](https://techdocs.f5.com/en-us/bigip-17-1-0.html) |
-| Referencia de comandos TMSH | [https://clouddocs.f5.com/cli/tmsh-reference/latest/](https://clouddocs.f5.com/cli/tmsh-reference/latest/) |
-| K12878: Generating a QKView diagnostic file | [https://my.f5.com/manage/s/article/K12878](https://my.f5.com/manage/s/article/K12878) |
-| K411: Overview of packet tracing with tcpdump | [https://my.f5.com/manage/s/article/K411](https://my.f5.com/manage/s/article/K411) |
-| F5 iHealth | [https://ihealth.f5.com/](https://ihealth.f5.com/) |
-| Wireshark 4.2.3 User Guide | [https://www.wireshark.org/docs/wsug_html/](https://www.wireshark.org/docs/wsug_html/) |
+| `create` indica que el objeto ya existe | Utiliza `list` y no lo recrees sin revisar su contenido |
+| HTTP `:8083` no responde | `show ltm virtual vs_lab08_http`, `show ltm pool pool_lab08 members`, SNAT AutoMap y conectividad desde Ubuntu |
+| `tcpdump` muestra solo Health Monitors | Identifica `?lab08=` en el PCAP y utiliza el filtro que incluye `:8083` |
+| No hay RST en el PCAP | Es normal: no todas las fallas producen reset; documenta el comportamiento real |
+| `show sys cpu` no sube con 60 solicitudes | La carga es muy pequeña y breve; la métrica puede muestrearse después del pico |
+| La prueba de límite no muestra conexiones simultáneas | HTTP/Apache puede cerrar sesiones antes de los 12 s; repite y observa la tabla en tiempo real, sin deducir falsamente que el límite falló |
+| `qkview` tarda o falla | Verifica espacio libre con `show sys disk`, revisa el mensaje concreto, no repitas indiscriminadamente |
+| QKView no aparece en la ruta propuesta | Lee la ruta informada por `qkview` y comprueba con `ls` |
 
----
+## Referencias oficiales
+
+- [Referencia TMSH de BIG-IP](https://clouddocs.f5.com/cli/tmsh-reference/latest/)
+- [Referencia de administración de pools y connection-limit](https://clouddocs.f5.com/cli/tmsh-reference/v16/modules/ltm/ltm_pool.html)
+- [Capturas tcpdump: capacitación F5](https://clouddocs.f5.com/training/community/adc/html/class4/module1/lab01.html)
+- [F5 iHealth](https://ihealth.f5.com/)
+
+**Alcance de certificación:** este laboratorio desarrolla habilidades prácticas de troubleshooting, pero **ningún laboratorio por sí solo garantiza aprobar una certificación**. Debe complementarse con los dominios oficiales del examen, teoría, práctica y evaluación.
+
 
 # Laboratorio 9 — Troubleshooting integral de una aplicación: Virtual Server, Pool, Health Monitor, Persistence, Profiles, Priority Groups, límites y análisis del tráfico de extremo a extremo
 
-## Metadatos
+## Datos generales
 
 | Campo | Valor |
 |---|---|
-| **Duración** | 60 minutos |
-| **Complejidad** | Alta |
-| **Nivel Bloom** | Aplicar (Apply) |
-| **Versión BIG-IP** | F5 BIG-IP VE 17.1.2 |
-| **Alineación curricular** | F5CAB5.03–F5CAB5.07; integra F5CAB1–F5CAB4 |
+| Duración total | **60 minutos** |
+| Nivel | Administración BIG-IP; complemento práctico para F5CAB1–F5CAB5 |
+| Modalidad | **Configurar por GUI (TMUI) y validar mediante CLI (TMSH)** |
+| Prerrequisito | Laboratorios 1–8 finalizados; BIG-IP VE, Ubuntu y Web01/Web02 operativos |
+| Alcance | **Sin HA. Sin instalaciones adicionales. Sin SSH a los backends.** |
 
-## Descripción General
+## Objetivo
 
-Este laboratorio es el ejercicio de integración final del curso. El estudiante recibe un entorno BIG-IP preconfigurado con una aplicación web HTTPS publicada a través de un Virtual Server, un Pool con Priority Groups, Cookie Persistence, Health Monitor HTTP y Connection Limits. El entorno ha sido deliberadamente saboteado con **seis fallas inyectadas simultáneamente** que el estudiante debe descubrir, diagnosticar y corregir aplicando la metodología sistemática de cinco fases: **Identificar → Aislar → Diagnosticar → Corregir → Verificar**. Al finalizar, el estudiante genera un QKView, lo sube a iHealth y completa una hoja de registro de troubleshooting con evidencias medibles para cada falla.
+Demostrar, con resultados **observables desde Ubuntu y medibles en TMSH**, tipos de Virtual Server, selección de tráfico, expiración TCP, prioridad con conmutación de miembros, persistencia mediante cookies, diagnóstico de fallas de monitor y publicación, y una falla SSL reproducible sobre un Virtual Server exclusivo. **La configuración se realiza exclusivamente mediante TMUI; TMSH se usa para consultar y verificar.** No se requiere instalar herramientas y no se accede por SSH a los backends.
 
-## Objetivos de Aprendizaje
+> **Regla de esta versión:** una actividad solo se considera demostrada cuando existe evidencia de **antes → cambio → después → restauración**. Configurar un campo y leer ese mismo campo no demuestra comportamiento. Se probará **Client SSL** en una VIP HTTPS exclusiva: primero funcionará, después fallará al retirar su perfil y finalmente volverá a funcionar al restaurarlo. **Server SSL hacia Web01/Web02** requiere un backend HTTPS, por lo que no se simulará su funcionamiento.
 
-- [ ] Aplicar la metodología de troubleshooting de cinco fases (Identificar → Aislar → Diagnosticar → Corregir → Verificar) para resolver seis fallas inyectadas simultáneamente en un BIG-IP, documentando síntomas, causas raíz y acciones correctivas con evidencia medible.
-- [ ] Diagnosticar y corregir fallas en Virtual Server, Pool, Health Monitor, Persistence y Profiles utilizando `tmsh`, TMUI, estadísticas de objetos y logs del sistema (`/var/log/ltm`).
-- [ ] Ejecutar y analizar capturas de paquetes (`tcpdump`) en BIG-IP para inspeccionar el flujo cliente→VIP→Pool Member, identificando anomalías TCP/HTTP y correlacionándolas con las fallas detectadas.
-- [ ] Evaluar la utilización de recursos del sistema (CPU, memoria, disco, interfaces) antes y después de las correcciones para confirmar el impacto de las fallas en el rendimiento, comparando contra una línea base operativa.
-- [ ] Generar un QKView, subirlo a F5 iHealth e interpretar al menos dos diagnósticos automatizados relacionados con las fallas corregidas.
+## Topología de trabajo
 
-## Prerrequisitos
-
-### Conocimiento requerido
-
-| Área | Detalle |
-|---|---|
-| Laboratorios previos | Haber completado los laboratorios 1–8 (módulos F5CAB1–F5CAB4) o poseer conocimiento equivalente |
-| BIG-IP LTM | Creación y administración de Virtual Servers, Pools, Health Monitors, Persistence Profiles, SSL Profiles |
-| Comandos `tmsh` | `show ltm virtual`, `show ltm pool`, `show ltm monitor`, `show ltm persistence persist-records`, `show sys performance`, `show sys memory`, `show sys disk`, `show net interface` |
-| TCP/IP | Three-way handshake, HTTP/HTTPS, cookies HTTP, direccionamiento IP, VLANs |
-| BIG-IP conceptos | Diferencia entre *configured state* y *availability state*, Priority Group Activation threshold, Connection Limits |
-| Herramientas | `curl` 8.5.0, `tcpdump`, Wireshark 4.2.5, Apache `ab` 2.4.58 |
-
-### Acceso requerido
-
-| Recurso | Credenciales / Método |
-|---|---|
-| TMUI BIG-IP | `https://192.0.2.245` — usuario `admin` |
-| SSH BIG-IP | `ssh root@192.0.2.245` |
-| Cliente de pruebas | `10.10.10.10` — acceso SSH y navegador Firefox ESR 128.0 |
-| Cliente de administración | `192.0.2.10` — conectividad a red Management y VLAN External |
-| Cuenta F5 iHealth | Cuenta registrada en `https://ihealth.f5.com` ([enlace oficial](https://ihealth.f5.com)) |
-| Servidores web | `web01` (10.20.20.11) y `web02` (10.20.20.12) — acceso SSH para validación |
-
-## Entorno de Laboratorio
-
-### Topología de red
-
-```
-┌──────────────┐         VLAN External          ┌──────────────────┐         VLAN Internal         ┌─────────────┐
-│   Cliente     │        10.10.10.0/24           │    BIG-IP VE     │        10.20.20.0/24          │   web01      │
-│ 10.10.10.10   │◄──────────────────────────────►│ Ext: 10.10.10.245│◄────────────────────────────►│ 10.20.20.11  │
-│               │                                │ Int: 10.20.20.245│                               └─────────────┘
-│               │                                │ Mgmt:192.0.2.245 │                               ┌─────────────┐
-└──────────────┘                                 └──────────────────┘◄────────────────────────────►│   web02      │
-                                                                                                    │ 10.20.20.12  │
-  Admin: 192.0.2.10 ──── Red Management 192.0.2.0/24 ──── BIG-IP Mgmt: 192.0.2.245                └─────────────┘
+```mermaid
+flowchart LR
+  U["Ubuntu — cliente\neth1 10.1.3.4\neth0 10.1.1.246"] -->|"HTTP 8084, 8085, 8086 / HTTPS 8444"| F["BIG-IP VE\nMgmt 10.1.1.200\nExternal 10.1.3.200\nInternal 10.1.2.200"]
+  F -->|"Pool de prueba / SNAT AutoMap"| W1["Web01 10.1.2.4:80"]
+  F -->|"Pool de prueba / SNAT AutoMap"| W2["Web02 10.1.2.5:80"]
 ```
 
-### Configuración objetivo (estado correcto antes de la inyección de fallas)
+| Componente | Dirección | Uso |
+|---|---|---|
+| Acceso GUI desde Firefox en Ubuntu | `https://10.1.1.200` | Configuración de objetos |
+| SSH a BIG-IP | `ssh adminazure@10.1.1.200` | Validación CLI; inicia en **TMSH** |
+| Ubuntu cliente | `10.1.3.4` | `curl`, Bash y prueba TCP |
+| BIG-IP Self IP externa | `10.1.3.200` | La IP existente, compartida en diferentes puertos |
+| BIG-IP Self IP interna | `10.1.2.200` | SNAT AutoMap |
+| Web01 / Web02 | `10.1.2.4:80` / `10.1.2.5:80` | Servidores de aplicación |
 
-| Objeto | Configuración esperada |
-|---|---|
-| **Virtual Server** `vs_app_https` | Dirección: `10.10.10.100:443`, tipo Standard, protocolo TCP, Client SSL Profile: `clientssl_app`, HTTP Profile: `http_app`, Default Pool: `pool_app`, estado Enabled |
-| **Pool** `pool_app` | Método LB: Round Robin, Priority Group Activation: 1, Monitor: `mon_http_app` |
-| **Pool Member** `10.20.20.11:80` | Priority Group: 10, Connection Limit: 0 (sin límite), estado Enabled |
-| **Pool Member** `10.20.20.12:80` | Priority Group: 10, Connection Limit: 0 (sin límite), estado Enabled |
-| **Health Monitor** `mon_http_app` | Tipo HTTP, Interval: 5, Timeout: 16, Send: `GET / HTTP/1.1\r\nHost: localhost\r\n\r\n`, Receive: `200 OK` |
-| **Persistence Profile** `persist_cookie_app` | Tipo Cookie, método Insert, Cookie Name: `BIGipServer_pool_app`, Expiration: 0 (sesión) |
-| **Client SSL Profile** `clientssl_app` | Certificado y clave autofirmados, protocolo TLS 1.2+, asociado al VS |
-| **HTTP Profile** `http_app` | Valores por defecto, asociado al VS |
+**Convenciones:** en la consola TMSH escribe los comandos `list`, `show` y `show sys ...` **sin** prefijo `tmsh`. Los comandos con `curl` y `/dev/tcp` se ejecutan **en Ubuntu**, no en TMSH. En TMUI los nombres de menús pueden variar ligeramente entre versiones; usa la sección equivalente.
 
-### Las seis fallas inyectadas (referencia para el instructor)
+**Protección del entorno:** no modifiques los Virtual Servers `:8080`, `:8081`, `:8082`, `:8083` ni `:8443`, sus pools, ni las interfaces físicas o rutas existentes. El puerto `8444` se reserva para la prueba SSL si está libre. Este laboratorio crea objetos con el sufijo `_lab09`. No cambies la IP de administración, el puerto *lockdown*, la licencia ni el volumen de arranque. **No ejecutes Activate/Reboot/Install.**
 
-> **NOTA PARA EL INSTRUCTOR:** Las siguientes fallas deben inyectarse **antes** de que el estudiante acceda al entorno. El estudiante **no** conoce esta lista; debe descubrir cada falla mediante la metodología de troubleshooting.
+## Plan de 60 minutos
 
-| # | Componente | Falla inyectada | Efecto observable |
+| Etapa | Experimento | Min |
+|---|---|---:|
+| 1 | Reconocer VLAN, interfaz, software y rutas | 5 |
+| 2 | Comparar Standard / FastL4 / Reject con tráfico real | 9 |
+| 3 | Probar precedencia específico/wildcard cuando exista IP libre | 6 |
+| 4 | Medir una sesión que vence por TCP Idle Timeout | 9 |
+| 5 | Probar Priority Group Activation y failover Web01 → Web02 | 8 |
+| 6 | Comparar Round Robin frente a Cookie Persistence | 7 |
+| 7 | Resolver dos fallas reproducibles: monitor y VS deshabilitado | 7 |
+| 8 | Provocar y corregir una falla Client SSL; limpiar y verificar | 9 |
+| **Total** | | **60** |
+
+---
+
+## Etapa 1. Inspeccionar sin alterar el sistema — 5 min
+
+**Pregunta que resuelve:** antes de publicar tráfico, ¿qué red, recursos y versión de software tiene realmente BIG-IP?
+
+### 1.1 Explorar desde TMUI (3 min)
+
+1. Abre `https://10.1.1.200` e inicia sesión.
+2. Ve a **Network > Interfaces**: localiza `1.1` (External) y `1.2` (Internal); anota estado y velocidad reportada. **No cambies Media/duplex**.
+3. Ve a **Network > VLANs** y abre `External` e `Internal`; identifica en qué interfaz está cada VLAN y si sus miembros son *Tagged* o *Untagged*. Ve después a **Network > Self IPs** y reconoce `10.1.3.200` / `10.1.2.200`.
+4. Ve a **Network > Routes** y revisa la ruta predeterminada, si existe. **No crees ni borres rutas**.
+5. Ve a **System > License** (o la sección License del sistema) y anota el tipo/estado de licencia y módulos que aparezcan; después **System > Software Management > Boot Locations**. Identifica volumen **activo** y otros volúmenes, si existen. **No pulses Activate**.
+
+### 1.2 Verificar desde TMSH (2 min)
+
+```text
+show net interface 1.1
+show net interface 1.2
+list net vlan External
+list net vlan Internal
+list net self
+list net route
+show sys version
+show sys license
+show sys software status
+```
+
+> **Nota:** si `show sys software status` presenta un formato distinto o no está disponible, utiliza exclusivamente la pantalla **Boot Locations** para registrar el volumen activo. Un equipo puede tener un solo volumen de arranque. Ver la licencia no significa modificarla.
+
+**Anota:** interfaz externa `_____`, modo Tagged/Untagged `_____`, ruta predeterminada `_____ / no existe`, versión `_____`, licencia `_____`, volumen activo `_____`.
+
+**Interpreta:** ¿por qué no corresponde instalar una imagen ni activar otro volumen en una práctica de 60 minutos con un solo equipo compartido?
+
+---
+
+## Etapa 2. Comparar tres tipos de Virtual Server — 9 min
+
+**Pregunta que resuelve:** ¿por qué un Standard VS, un Performance L4 y un Reject VS no deben utilizarse indistintamente?
+
+### 2.1 Crear un pool exclusivo desde TMUI (3 min)
+
+1. **Local Traffic > Pools > Pool List > Create**.
+2. **Name:** `pool_lab09`.
+3. **Health Monitors:** selecciona inicialmente el monitor HTTP incorporado `http`. **No lo modifiques**, pues puede estar usado por otros pools. En la Etapa 7 crearás un monitor exclusivo `mon_lab09_http` para diagnosticar una falla sin afectar otros laboratorios.
+4. **Load Balancing Method:** `Round Robin`.
+5. **New Members:** añade `10.1.2.4` puerto `80` y `10.1.2.5` puerto `80` (pulsa **Add** después de cada uno); termina en **Finished**. Mantén los dos con **Priority Group 0** y **Priority Group Activation Disabled** hasta la Etapa 7.
+6. En TMSH valida:
+
+```text
+list ltm pool pool_lab09
+show ltm pool pool_lab09 members
+```
+
+**Esperado:** dos members disponibles tras completar sus comprobaciones. Si no lo están, no continúes con las pruebas de tráfico; revisa monitor y IP, sin modificar Web01/Web02.
+
+### 2.2 Crear Standard VS — HTTP de aplicación (3 min)
+
+1. **Local Traffic > Virtual Servers > Virtual Server List > Create**.
+2. **Name:** `vs_lab09_standard`; **Type:** `Standard`; **Destination:** `10.1.3.200`; **Service Port:** `8084`; **Protocol:** `TCP`.
+3. Cambia **Configuration** a `Advanced` si es necesario. Selecciona **HTTP Profile:** `http` y **TCP Profile:** `tcp` (Client y Server cuando la pantalla los muestre).
+4. **Source Address Translation:** `Auto Map` (SNAT); **Default Pool:** `pool_lab09`.
+5. Guarda con **Finished**.
+6. CLI:
+
+```text
+list ltm virtual vs_lab09_standard
+show ltm virtual vs_lab09_standard
+```
+
+7. Ubuntu:
+
+```bash
+curl --noproxy '*' -sS -w '\nHTTP %{http_code}\n' http://10.1.3.200:8084/
+```
+
+**Esperado:** contenido Web01 o Web02, código HTTP `200`.
+
+### 2.3 Crear Performance (Layer 4) — transporte (2 min)
+
+1. Crea otro VS: **Name** `vs_lab09_fastl4`, **Type** `Performance (Layer 4)`, **Destination** `10.1.3.200`, **Service Port** `8085`, **Protocol** TCP.
+2. En **Configuration: Advanced**, verifica **Protocol Profile (Client)** = `fastL4` (o perfil incorporado equivalente). Elige **Default Pool** `pool_lab09` y **Source Address Translation** `Auto Map`.
+3. Termina; valida:
+
+```text
+list ltm virtual vs_lab09_fastl4
+show ltm virtual vs_lab09_fastl4
+```
+
+4. Ubuntu:
+
+```bash
+curl --noproxy '*' -sS -w '\nHTTP %{http_code}\n' http://10.1.3.200:8085/
+```
+
+**Esperado:** respuesta HTTP del backend cuando la configuración de FastL4 y SNAT permite la comunicación. **No esperes un HTTP Profile en este VS**: trabaja en L4, no hace inspección HTTP como el Standard con perfil HTTP.
+
+### 2.4 Crear Reject — rechazo deliberado (1 min)
+
+1. Crea un VS: `vs_lab09_reject`, **Type:** `Reject`, **Destination** `10.1.3.200`, **Port** `8086`, **Protocol** `TCP`.
+2. Finaliza; **este VS no necesita pool**.
+3. TMSH:
+
+```text
+list ltm virtual vs_lab09_reject
+```
+
+4. Ubuntu:
+
+```bash
+curl --noproxy '*' -v --connect-timeout 3 --max-time 5 http://10.1.3.200:8086/
+```
+
+**Esperado:** la conexión **no** obtiene la página Web01/Web02. Puede verse rechazo/reset; el mensaje exacto depende del tráfico y del cliente.
+
+**Completa la tabla:**
+
+| Tipo | Puerto | ¿Tiene pool? | ¿Devuelve Web01/Web02? | Principal decisión de uso |
+|---|---:|---|---|---|
+| Standard | 8084 | Sí | | |
+| Performance L4 | 8085 | Sí | | |
+| Reject | 8086 | No | | |
+
+---
+
+## Etapa 3. Precedencia de VS específicos y wildcard — 6 min
+
+**Pregunta que resuelve:** cuando dos VS pueden coincidir con el mismo destino, ¿cuál recibe la conexión?
+
+> **Aislamiento obligatorio:** para no interceptar los puertos de los laboratorios previos, usa la IP **adicional** `10.1.3.201`, **solo si el instructor confirma que está libre y reservada para este laboratorio**. Nunca crees un wildcard `10.1.3.200:*`. Si `10.1.3.201` no está disponible, realiza únicamente la comparación de configuraciones y contesta el escenario; no actives un wildcard en la IP compartida.
+
+### 3.1 Preparar y configurar desde TMUI (4 min)
+
+1. El instructor confirma que `10.1.3.201` está disponible. En **Local Traffic > Virtual Servers > Create**, crea `vs_lab09_wildcard`, **Type: Reject**, **Destination: `10.1.3.201`**, **Service Port: `* All Ports` (puerto 0)** y **Protocol: TCP**. Finaliza.
+2. Crea `vs_lab09_especifico`, **Type: Standard**, **Destination: `10.1.3.201`**, **Service Port: `8087`**, **Protocol: TCP**, **HTTP Profile: `http`**, **Default Pool: `pool_lab09`**, **SNAT: Auto Map**.
+3. Confirma por TMSH que los **dos destinos** coinciden en dirección, pero **uno tiene puerto específico y el otro acepta todos los puertos**:
+
+```text
+list ltm virtual vs_lab09_wildcard
+list ltm virtual vs_lab09_especifico
+show ltm virtual vs_lab09_wildcard
+show ltm virtual vs_lab09_especifico
+```
+
+### 3.2 Probar desde Ubuntu (2 min)
+
+```bash
+curl --noproxy '*' -sS -w '\nHTTP %{http_code}\n' --max-time 5 http://10.1.3.201:8087/
+curl --noproxy '*' -v --connect-timeout 3 --max-time 5 http://10.1.3.201:8088/
+```
+
+**Esperado, si la IP está libre, se anuncia correctamente y los VS están disponibles:** `:8087` muestra Web01/Web02 porque gana la coincidencia **específica**; `:8088` es rechazado por el **wildcard**. Si no hay respuesta en ninguno, verifica primero ARP, disponibilidad y que el cliente realmente alcance la IP adicional; no atribuyas el fallo a la precedencia antes de comprobar la conectividad.
+
+**Anota:** `8087 -> VS ________`, `8088 -> VS ________`. **Conclusión:** el VS específico tiene prioridad sobre el wildcard correspondiente; la coincidencia efectiva también depende de protocolo, dirección, ruta, VLAN y otras condiciones.
+
+---
+
+## Etapa 4. Demostrar TCP Idle Timeout con dos mediciones — 9 minutos
+
+**Problema real:** un usuario abre una conexión TCP hacia un servicio y no termina de enviar su petición HTTP. ¿Cuándo decide BIG-IP cerrar una conexión inactiva?
+
+**Resultado que debes obtener:** una solicitud con pausa de **2 segundos** recibe HTTP 200; la misma solicitud con pausa de **9 segundos** falla cuando el perfil cliente tiene `idle-timeout 5`. Antes de asignar el perfil corto, ambas deberían completar la solicitud.
+
+### 4.1 Prueba de referencia, sin cambiar nada — Ubuntu (2 min)
+
+En **Ubuntu Terminal** pega este bloque. Usa Python 3, que ya forma parte de la estación; **no instales paquetes**.
+
+```bash
+python3 - <<'PY'
+import socket, time
+host, port = '10.1.3.200', 8084
+for pausa in (2, 9):
+    try:
+        with socket.create_connection((host, port), timeout=4) as s:
+            s.settimeout(4)
+            s.sendall(b'GET /?lab09_tcp=1 HTTP/1.1\r\nHost: 10.1.3.200\r\n')
+            time.sleep(pausa)  # Cabeceras incompletas: no se envia la linea vacia
+            s.sendall(b'Connection: close\r\n\r\n')
+            data = s.recv(512)
+            print(f'Pausa {pausa}s: {data.splitlines()[0].decode(errors="replace") if data else "conexion cerrada"}')
+    except (OSError, TimeoutError) as e:
+        print(f'Pausa {pausa}s: fallo: {type(e).__name__}: {e}')
+PY
+```
+
+**Qué ver:** en ambas pruebas normalmente aparecerá `HTTP/1.1 200 OK` o `HTTP/1.0 200 OK`. Si alguna falla antes de cambiar el perfil, **no continúes**: confirma que `vs_lab09_standard` entrega HTTP 200 con `curl` y que no hay otro timeout configurado.
+
+**Registra:** pausa 2 s: `_____`; pausa 9 s: `_____`.
+
+### 4.2 Configurar el límite en TMUI — BIG-IP (2 min)
+
+1. En Firefox: **Local Traffic > Profiles > Protocol > TCP > Create**.
+2. **Name:** `tcp_lab09_corto`. **Parent Profile:** `tcp`.
+3. Activa **Custom** en **Idle Timeout** y asigna **5 segundos**. No alteres otros parámetros. **Finished**.
+4. Abre **Local Traffic > Virtual Servers > Virtual Server List > vs_lab09_standard > Properties**.
+5. Cambia **Configuration** a **Advanced**. En **Protocol Profile (Client)** selecciona `tcp_lab09_corto`; conserva el perfil de servidor actual. Pulsa **Update**.
+6. En la terminal SSH del BIG-IP (ya en **TMSH**):
+
+```text
+list ltm profile tcp tcp_lab09_corto idle-timeout
+list ltm virtual vs_lab09_standard profiles
+```
+
+**Qué comprobar:** aparece `idle-timeout 5` y `tcp_lab09_corto` asignado al **lado cliente**. Si no se ve el perfil en el VS, no hagas la segunda medición hasta corregir la asociación.
+
+### 4.3 Repetir exactamente la misma prueba — Ubuntu (3 min)
+
+Repite **sin cambiar nada** el bloque Python del apartado 4.1.
+
+**Salida ilustrativa**, no literal:
+
+```text
+Pausa 2s: HTTP/1.1 200 OK
+Pausa 9s: conexion cerrada
+```
+
+También puede aparecer `BrokenPipeError`, `ConnectionResetError` u otro fallo para 9 segundos: el cierre exacto depende de cómo BIG-IP y el cliente detecten la terminación. **La evidencia es el contraste con la primera medición**, no un mensaje de error determinado.
+
+**Interpretación:** el tiempo de espera mide inactividad de la conexión TCP, **no** la duración máxima de una solicitud que sigue intercambiando datos.
+
+### 4.4 Recuperar el servicio — TMUI → TMSH → Ubuntu (2 min)
+
+1. Vuelve a `vs_lab09_standard > Properties` y restaura **Protocol Profile (Client): `tcp`**.
+2. TMSH: `list ltm virtual vs_lab09_standard profiles` debe volver a mostrar el perfil `tcp`.
+3. Ubuntu:
+
+```bash
+curl --noproxy '*' -sS -o /dev/null -w 'HTTP %{http_code}\n' http://10.1.3.200:8084/
+```
+
+**Debe resultar:** `HTTP 200`.
+
+| Evidencia a entregar | Antes | Con Idle Timeout = 5 s |
+|---|---|---|
+| Petición con pausa de 2 s | | |
+| Petición con pausa de 9 s | | |
+| Perfil cliente asociado (TMSH) | `tcp` | `tcp_lab09_corto` |
+
+**Pregunta:** si una solicitud falla solo después de permanecer inactiva varios segundos, ¿por qué no debes atribuir el problema inicialmente a un Health Monitor?
+
+---
+
+## Etapa 5. Priority Group Activation: observar failover real — 8 minutos
+
+**Problema real:** una aplicación tiene Web01 como servidor preferido y Web02 como respaldo. ¿Cómo comprobamos que BIG-IP **deja de enviar tráfico al primero** cuando administrativamente se le excluye de nuevas conexiones?
+
+**Resultado esperado:** antes del cambio, las respuestas llegan desde **Web01**; al marcar Web01 **Forced Offline** a nivel del *pool member* exclusivo del Lab 9, las nuevas solicitudes van a **Web02**; al devolver Web01 a Enabled, vuelve a ser el preferido.
+
+> La prueba mide **selección de miembros y failover administrativo**, no el comportamiento de *Action on Service Down* sobre una conexión TCP existente. Ese mecanismo requiere provocar una caída real de servicio durante una conexión activa, algo que estos backends rápidos no permiten garantizar. No lo presentaremos como una evidencia falsa.
+
+### 5.1 Establecer prioridades en TMUI (2 min)
+
+1. En Firefox: **Local Traffic > Pools > Pool List > pool_lab09 > Members**.
+2. Abre `10.1.2.4:80` (**Web01**). En **Priority Group** selecciona **10** y pulsa **Update**.
+3. Abre `10.1.2.5:80` (**Web02**). Pon **Priority Group 5** y pulsa **Update**.
+4. Ve a **pool_lab09 > Properties > Advanced**; habilita **Priority Group Activation** y establece **Less than 1 available member** (valor `1`). Guarda con **Update**.
+5. En TMSH:
+
+```text
+list ltm pool pool_lab09
+show ltm pool pool_lab09 members
+```
+
+**Busca:** `min-active-members 1`, prioridades `10` y `5`, y **ambos miembros Available**. Si un miembro está Offline, esta prueba no distingue prioridades de monitoreo: corrígelo antes.
+
+### 5.2 Comprobar el servidor preferido — Ubuntu (1 min)
+
+```bash
+for i in $(seq 1 6); do curl --noproxy '*' -sS -H 'Connection: close' --max-time 5 http://10.1.3.200:8084/; echo; done
+```
+
+**Debe observarse:** la página identifica **WEB01** en las seis solicitudes si el grupo de prioridad 10 tiene un miembro disponible. Si el contenido no muestra el nombre, utiliza la diferencia de contadores al repetir `show ltm pool pool_lab09 members`.
+
+**Anota:** backend con prioridad más alta: `_____`.
+
+### 5.3 Provocar el failover sin tocar Web01 en otros laboratorios (2 min)
+
+1. En TMUI regresa a **pool_lab09 > Members**.
+2. Selecciona **únicamente** el miembro `10.1.2.4:80` de este pool y elige **Forced Offline** (no el *node* global). No cambies el monitor ni el servidor Web01.
+3. TMSH:
+
+```text
+show ltm pool pool_lab09 members
+```
+
+**Qué comprobar:** Web01 tiene estado administrativo `forced offline`; Web02 continúa disponible.
+
+4. **Ubuntu** repite las seis solicitudes del apartado 5.2.
+
+**Debe observarse:** ahora responde **WEB02** en las nuevas conexiones. Si hay conexiones anteriores abiertas, ciérralas; cada `curl` de la prueba abre su propia conexión.
+
+### 5.4 Restaurar y demostrar recuperación — GUI → Ubuntu (3 min)
+
+1. En el miembro `10.1.2.4:80` selecciona **Enable**.
+2. En TMSH vuelve a ejecutar `show ltm pool pool_lab09 members`: ambos deben estar disponibles.
+3. Repite seis solicitudes desde Ubuntu: deben volver a **WEB01**.
+4. En TMUI restaura **Priority Group Activation: Disabled** (`min-active-members 0`) y **Priority Group: 0** en ambos members. Confirma con:
+
+```text
+list ltm pool pool_lab09
+```
+
+| Momento | Estado Web01 | Estado Web02 | Backend que respondió |
 |---|---|---|---|
-| F1 | Virtual Server | Estado administrativo cambiado a **Disabled** | VS no acepta conexiones; Network Map muestra icono negro |
-| F2 | Virtual Server | HTTP Profile **removido** del VS (incompatibilidad: VS HTTPS sin HTTP Profile impide procesamiento L7) | Sin inspección HTTP, cookie persistence no puede operar |
-| F3 | Health Monitor | Receive String cambiada a `"404 Not Found"` (no coincide con respuesta real del servidor que devuelve `200 OK`) | Todos los Pool Members marcados como *Offline* (rojo) |
-| F4 | Pool | Priority Group Activation threshold cambiado a **99** (inalcanzable con 2 members en PG-10) | Incluso con members disponibles, el pool no activa tráfico correctamente |
-| F5 | Pool Members | Connection Limit de `10.20.20.11:80` establecido en **1** | Después de 1 conexión concurrente, el member rechaza nuevas conexiones; distribución de carga desequilibrada |
-| F6 | Persistence | Cookie Name cambiado a una cadena vacía `""` | BIG-IP no puede insertar cookie de persistence; las sesiones no se mantienen |
+| Inicio, PG 10 / PG 5 | Available | Available | |
+| Web01 Forced Offline | Forced Offline | Available | |
+| Web01 Enabled de nuevo | Available | Available | |
 
-### Comandos de inyección de fallas (solo instructor)
+**Pregunta de examen:** ¿por qué `Round Robin` no garantiza distribución 50/50 si existen grupos de prioridad activos?
+
+---
+
+## Etapa 6. Cookie Persistence: demostrar que el cliente conserva el mismo backend — 7 minutos
+
+**Problema real:** una aplicación con sesiones necesita que un cliente regrese al mismo servidor. ¿Cómo diferenciar balanceo Round Robin de persistencia mediante cookie?
+
+**Resultado esperado:** sin persistencia, seis conexiones independientes alternan entre Web01/Web02; con una cookie guardada y reenviada, las conexiones del **mismo cliente** mantienen el backend seleccionado.
+
+### 6.1 Prueba sin persistencia — TMUI, TMSH y Ubuntu (2 min)
+
+1. Verifica que en **Local Traffic > Virtual Servers > vs_lab09_standard > Resources**, **Default Persistence Profile** esté en **None**. No modifiques otros VS.
+2. En TMSH:
+
+```text
+list ltm virtual vs_lab09_standard persist
+list ltm pool pool_lab09 load-balancing-mode
+```
+
+**Busca:** sin perfil de persistencia predeterminado, balanceo `round-robin`, los dos miembros Available y prioridades restauradas a 0.
+
+3. Desde Ubuntu ejecuta:
 
 ```bash
-## F1: Deshabilitar Virtual Server
-tmsh modify ltm virtual vs_app_https disabled
-
-## F2: Eliminar HTTP Profile del Virtual Server
-tmsh modify ltm virtual vs_app_https profiles delete { http_app }
-
-## F3: Cambiar Receive String del Health Monitor
-tmsh modify ltm monitor http mon_http_app recv "404 Not Found"
-
-## F4: Cambiar Priority Group Activation threshold
-tmsh modify ltm pool pool_app min-active-members 99
-
-## F5: Establecer Connection Limit en Pool Member
-tmsh modify ltm pool pool_app members { 10.20.20.11:80 { connection-limit 1 } }
-
-## F6: Vaciar Cookie Name en Persistence Profile
-tmsh modify ltm persistence cookie persist_cookie_app cookie-name ""
-
-## Guardar configuración
-tmsh save sys config
+for i in $(seq 1 6); do curl --noproxy '*' -sS -H 'Connection: close' --max-time 5 http://10.1.3.200:8084/; echo; done
 ```
 
-### Verificación previa del entorno (instructor)
+**Qué ver:** respuestas WEB01 y WEB02 (si el contenido permite distinguirlos); en Round Robin suele alternar cuando cada conexión es nueva. **Anota** la secuencia real: `____, ____, ____, ____, ____, ____`.
+
+### 6.2 Crear y asociar Cookie Insert — TMUI (2 min)
+
+1. Ve a **Local Traffic > Profiles > Persistence > Create**.
+2. Completa **Name `persist_cookie_lab09`**, **Persistence Type `Cookie`**, **Parent Profile `cookie`**, **Cookie Method `HTTP Cookie Insert`** (si es necesario selecciona **Custom** para editar). **Finished**.
+3. Abre **Local Traffic > Virtual Servers > vs_lab09_standard > Resources**.
+4. En **Default Persistence Profile** elige `persist_cookie_lab09` y pulsa **Update**.
+5. En TMSH:
+
+```text
+list ltm persistence cookie persist_cookie_lab09
+list ltm virtual vs_lab09_standard persist
+list ltm virtual vs_lab09_standard profiles
+```
+
+**Busca:** el VS tiene persistencia `persist_cookie_lab09` y conserva un perfil HTTP (`http`). **Sin procesamiento HTTP no puedes demostrar Cookie Insert.**
+
+### 6.3 Guardar y reutilizar una cookie — Ubuntu (2 min)
+
+En Ubuntu pega las instrucciones **en este orden**:
 
 ```bash
-## Confirmar que los servidores web responden
-curl -s -o /dev/null -w "%{http_code}" http://10.20.20.11/
-## Esperado: 200
-
-curl -s -o /dev/null -w "%{http_code}" http://10.20.20.12/
-## Esperado: 200
-
-## Confirmar que BIG-IP es accesible
-tmsh show sys version
-## Esperado: BIG-IP 17.1.2
+rm -f /tmp/lab09_cookie.txt
+curl --noproxy '*' -sS -D /tmp/lab09_headers.txt -c /tmp/lab09_cookie.txt -H 'Connection: close' http://10.1.3.200:8084/
+echo '--- CABECERA INSERTADA POR BIG-IP ---'
+grep -i '^Set-Cookie:' /tmp/lab09_headers.txt
+echo '--- CLIENTE QUE REUTILIZA LA COOKIE ---'
+for i in $(seq 1 6); do curl --noproxy '*' -sS -b /tmp/lab09_cookie.txt -c /tmp/lab09_cookie.txt -H 'Connection: close' http://10.1.3.200:8084/; echo; done
 ```
 
-## Instrucciones Paso a Paso
+**Qué ver:**
+
+- Primera solicitud: `Set-Cookie: BIGipServer...=...` (el nombre concreto depende de la configuración).
+- Seis solicitudes posteriores: **WEB01 seis veces** o **WEB02 seis veces**, siempre el **mismo servidor** en condiciones normales.
+- Si no aparece `Set-Cookie`, comprueba en TMSH el perfil HTTP y la persistencia asignados antes de concluir que el mecanismo falló.
+
+**Anota:** nombre de la cookie `_____`; backend seleccionado `_____`; ¿cambió en las siguientes seis solicitudes? `_____`.
+
+### 6.4 Desactivar y restaurar la configuración base — TMUI (1 min)
+
+1. Desde **vs_lab09_standard > Resources**, establece **Default Persistence Profile: None** y **Update**.
+2. TMSH: `list ltm virtual vs_lab09_standard persist` ya no debe indicar persistencia Cookie activa.
+3. Ejecuta dos nuevas solicitudes **sin** `-b` para no enviar la cookie anterior.
+4. **Conclusión:** ¿por qué observar HTTP 200 no basta para confirmar que una sesión tiene persistencia?
 
 ---
 
-### Paso 1: Registrar línea base de recursos del sistema
+## Etapa 7. Dos incidentes reales de troubleshooting — 7 minutos
 
-**Objetivo:** Capturar el estado de utilización de CPU, memoria, disco e interfaces del BIG-IP **antes** de iniciar las correcciones, para poder comparar después del restablecimiento del servicio.
+**Método:** **Identificar síntoma → inspeccionar estado (TMSH) → localizar causa (TMSH) → corregir (GUI) → repetir desde Ubuntu**.
 
-**Instrucciones:**
+### 7.1 Incidente A: el servidor responde HTTP 200, pero BIG-IP lo marca Offline — 5 min
 
-1. Desde el cliente de administración (`192.0.2.10`), inicie sesión SSH en el BIG-IP:
+**Estado inicial obligatorio:** `curl http://10.1.3.200:8084/` devuelve `200` y `show ltm pool pool_lab09 members` indica miembros disponibles.
 
-   ```bash
-   ssh root@192.0.2.245
-   ```
+**Preparación del monitor (TMUI, 2 min):**
 
-2. Capture el estado de rendimiento general del sistema:
+1. **Local Traffic > Monitors > Create**.
+2. Configura **Name:** `mon_lab09_http`; **Type:** `HTTP`; **Parent Monitor:** `http`; **Interval:** `5`; **Timeout:** `16`; **Send String:** `GET / HTTP/1.0\r\n\r\n`; **Receive String:** `200 OK`. Pulsa **Finished**.
+3. **Local Traffic > Pools > pool_lab09 > Properties > Health Monitors**: mueve **solo** `mon_lab09_http` a **Active**, quitando el predeterminado `http` **únicamente de `pool_lab09`**. Pulsa **Update**.
+4. En TMSH:
 
-   ```bash
-   tmsh show sys performance all-stats
-   ```
-
-3. Registre el uso de memoria:
-
-   ```bash
-   tmsh show sys memory
-   ```
-
-4. Registre la ocupación de disco:
-
-   ```bash
-   tmsh show sys disk logical-disk
-   ```
-
-5. Registre el estado y estadísticas de las interfaces de datos:
-
-   ```bash
-   tmsh show net interface 1.1
-   tmsh show net interface 1.2
-   ```
-
-6. Registre las estadísticas actuales del Virtual Server (incluso si está inoperante):
-
-   ```bash
-   tmsh show ltm virtual vs_app_https
-   tmsh show ltm virtual vs_app_https stats
-   ```
-
-7. Guarde toda la salida en un archivo de referencia:
-
-   ```bash
-   tmsh show sys performance all-stats > /var/tmp/baseline_pre.txt
-   tmsh show sys memory >> /var/tmp/baseline_pre.txt
-   tmsh show sys disk logical-disk >> /var/tmp/baseline_pre.txt
-   tmsh show net interface all-properties >> /var/tmp/baseline_pre.txt
-   tmsh show ltm virtual vs_app_https >> /var/tmp/baseline_pre.txt
-   echo "--- Baseline capturada: $(date) ---" >> /var/tmp/baseline_pre.txt
-   ```
-
-**Salida esperada:**
-
-- `show sys performance all-stats`: muestra porcentajes de CPU para System, TMM y otros procesos. En estado de reposo con fallas inyectadas, TMM CPU debería ser bajo (<5%) ya que no hay tráfico procesándose.
-- `show sys memory`: muestra TMM Memory Used y Other Memory Used. Valores típicos de laboratorio: <40% utilización total.
-- `show sys disk logical-disk`: particiones con al menos 20% de espacio libre.
-- `show net interface`: interfaces 1.1 y 1.2 con estado `up`, sin errores ni drops significativos.
-- `show ltm virtual`: el VS aparecerá con `Availability: offline` y `State: disabled`.
-
-**Verificación:**
-
-- [ ] El archivo `/var/tmp/baseline_pre.txt` existe y contiene datos de los cinco comandos.
-- [ ] Se identifican los valores de CPU TMM, memoria utilizada, espacio en disco disponible y estado de interfaces.
-
----
-
-### Paso 2: Identificar síntomas — prueba de conectividad y Network Map (FASE 1)
-
-**Objetivo:** Documentar el estado de disponibilidad de cada objeto BIG-IP y registrar el error que percibe el cliente al intentar acceder a la aplicación.
-
-**Instrucciones:**
-
-1. Desde el cliente de pruebas (`10.10.10.10`), intente acceder a la aplicación:
-
-   ```bash
-   curl -vk https://10.10.10.100/ 2>&1 | tee /tmp/curl_initial.txt
-   ```
-
-2. Registre el error obtenido. Con el VS deshabilitado, espere un rechazo de conexión o timeout.
-
-3. Acceda al TMUI desde el cliente de administración:
-
-   ```
-   https://192.0.2.245
-   ```
-
-4. Navegue a **Local Traffic → Network Map** y documente el estado de cada objeto:
-
-   | Objeto | Estado observado (color/icono) | Disponibilidad |
-   |---|---|---|
-   | `vs_app_https` | | |
-   | `pool_app` | | |
-   | `10.20.20.11:80` | | |
-   | `10.20.20.12:80` | | |
-
-5. Desde SSH al BIG-IP, confirme los estados con `tmsh`:
-
-   ```bash
-   tmsh show ltm virtual vs_app_https
-   tmsh show ltm pool pool_app
-   tmsh show ltm pool pool_app members
-   ```
-
-6. Revise los logs recientes para eventos relevantes:
-
-   ```bash
-   tail -100 /var/log/ltm | grep -iE "monitor|pool|virtual|error|down"
-   ```
-
-**Salida esperada:**
-
-- `curl`: error de tipo `Connection refused` o `Connection reset by peer` (el VS está deshabilitado).
-- Network Map: `vs_app_https` con icono negro (Disabled), `pool_app` con icono rojo (Offline — todos los members marcados como no disponibles por el monitor).
-- `show ltm pool pool_app members`: ambos members con `State: enabled`, `Availability: offline` (monitor falla).
-- Logs en `/var/log/ltm`: mensajes indicando que el monitor `mon_http_app` marca members como down.
-
-**Verificación:**
-
-- [ ] Se documenta el error exacto del `curl` (código de error o mensaje).
-- [ ] Se registra el estado de cada objeto en Network Map.
-- [ ] Se identifican al menos dos síntomas distintos: VS deshabilitado y Pool Members offline.
-
----
-
-### Paso 3: Aislar y diagnosticar fallas — inspección jerárquica de componentes (FASE 2)
-
-**Objetivo:** Recorrer la jerarquía de troubleshooting (Virtual Server → Pool → Pool Members → Health Monitor → Persistence → Profiles) para identificar las seis fallas inyectadas.
-
-**Instrucciones:**
-
-#### 3a. Inspección del Virtual Server
-
-1. Liste la configuración completa del Virtual Server:
-
-   ```bash
-   tmsh list ltm virtual vs_app_https
-   ```
-
-2. Verifique los siguientes elementos y anote discrepancias:
-
-   | Atributo | Valor esperado | Valor observado | ¿Discrepancia? |
-   |---|---|---|---|
-   | Destination | `10.10.10.100:443` | | |
-   | State | `enabled` | | |
-   | Pool | `pool_app` | | |
-   | Profiles: `clientssl_app` | Presente | | |
-   | Profiles: `http_app` | Presente | | |
-   | IP Protocol | `tcp` | | |
-
-3. Identifique **Falla F1**: el estado administrativo es `disabled`.
-
-4. Identifique **Falla F2**: el HTTP Profile `http_app` no aparece en la lista de profiles. Sin HTTP Profile, el VS no puede procesar tráfico a nivel L7, lo que impide que Cookie Persistence funcione.
-
-   ```bash
-   tmsh list ltm virtual vs_app_https profiles
-   ```
-
-#### 3b. Inspección del Pool y Priority Groups
-
-5. Liste la configuración del Pool:
-
-   ```bash
-   tmsh list ltm pool pool_app
-   ```
-
-6. Verifique:
-
-   | Atributo | Valor esperado | Valor observado | ¿Discrepancia? |
-   |---|---|---|---|
-   | Load Balancing Mode | `round-robin` | | |
-   | Min Active Members | `1` | | |
-   | Monitor | `mon_http_app` | | |
-
-7. Identifique **Falla F4**: `min-active-members` es `99` en lugar de `1`. Con solo 2 members en PG-10, el threshold de 99 es inalcanzable, lo que provoca un comportamiento anómalo en la activación del Priority Group.
-
-#### 3c. Inspección de Pool Members y Connection Limits
-
-8. Liste los members con detalle:
-
-   ```bash
-   tmsh list ltm pool pool_app members
-   tmsh show ltm pool pool_app members
-   ```
-
-9. Verifique Connection Limits:
-
-   | Member | Connection Limit esperado | Connection Limit observado | ¿Discrepancia? |
-   |---|---|---|---|
-   | `10.20.20.11:80` | `0` (sin límite) | | |
-   | `10.20.20.12:80` | `0` (sin límite) | | |
-
-10. Identifique **Falla F5**: `10.20.20.11:80` tiene `connection-limit 1`.
-
-#### 3d. Inspección del Health Monitor
-
-11. Liste la configuración del monitor:
-
-    ```bash
-    tmsh list ltm monitor http mon_http_app
-    ```
-
-12. Verifique:
-
-    | Atributo | Valor esperado | Valor observado | ¿Discrepancia? |
-    |---|---|---|---|
-    | Interval | `5` | | |
-    | Timeout | `16` | | |
-    | Send String | `GET / HTTP/1.1\r\nHost: localhost\r\n\r\n` | | |
-    | Receive String | `200 OK` | | |
-
-13. Confirme qué responde realmente el backend:
-
-    ```bash
-    curl -s -o /dev/null -w "%{http_code}" http://10.20.20.11/
-    curl -s -o /dev/null -w "%{http_code}" http://10.20.20.12/
-    ```
-
-    Ambos deben devolver `200`.
-
-14. Identifique **Falla F3**: la Receive String es `"404 Not Found"` pero el servidor responde `200 OK`. El monitor nunca encuentra coincidencia y marca los members como offline.
-
-#### 3e. Inspección de Persistence
-
-15. Liste la configuración del Persistence Profile:
-
-    ```bash
-    tmsh list ltm persistence cookie persist_cookie_app
-    ```
-
-16. Verifique:
-
-    | Atributo | Valor esperado | Valor observado | ¿Discrepancia? |
-    |---|---|---|---|
-    | Method | `insert` | | |
-    | Cookie Name | `BIGipServer_pool_app` | | |
-    | Expiration | `0` | | |
-
-17. Identifique **Falla F6**: el `cookie-name` está vacío (`""`), lo que impide que BIG-IP inserte correctamente la cookie de persistence.
-
-#### 3f. Resumen de fallas identificadas
-
-18. Complete la tabla de hallazgos:
-
-    | # | Componente | Falla identificada | Impacto |
-    |---|---|---|---|
-    | F1 | Virtual Server | Estado `disabled` | VS no acepta tráfico |
-    | F2 | Virtual Server / Profiles | HTTP Profile ausente | Sin procesamiento L7; persistence inoperante |
-    | F3 | Health Monitor | Receive String incorrecta (`404 Not Found`) | Todos los members marcados offline |
-    | F4 | Pool | `min-active-members` = 99 | Priority Group Activation inalcanzable |
-    | F5 | Pool Member | Connection Limit = 1 en `10.20.20.11:80` | Distribución de carga desequilibrada |
-    | F6 | Persistence | Cookie Name vacío | Sessions no se mantienen |
-
-**Salida esperada:**
-
-Seis fallas documentadas con su componente, descripción y efecto observable.
-
-**Verificación:**
-
-- [ ] Se identificaron las 6 fallas antes de proceder a las correcciones.
-- [ ] Para cada falla se registró: el comando usado para detectarla, el valor incorrecto y el valor esperado.
-
----
-
-### Paso 4: Capturar tráfico para evidencia pre-corrección (FASE 3)
-
-**Objetivo:** Ejecutar una captura de paquetes en BIG-IP para documentar el comportamiento anómalo del tráfico antes de aplicar correcciones.
-
-**Instrucciones:**
-
-1. Desde SSH al BIG-IP, inicie una captura en la interfaz virtual `0.0` (captura todo el tráfico procesado por TMM):
-
-   ```bash
-   tcpdump -ni 0.0 -s 0 -w /var/tmp/capture_pre_fix.pcap host 10.10.10.100 &
-   TCPDUMP_PID=$!
-   echo "tcpdump PID: $TCPDUMP_PID"
-   ```
-
-2. Desde el cliente de pruebas, genere tráfico durante 30 segundos:
-
-   ```bash
-   # Intentar conexión HTTPS (fallará porque VS está disabled)
-   curl -vk --connect-timeout 5 https://10.10.10.100/ 2>&1 | tee /tmp/curl_pre_fix.txt
-
-   # Intentar múltiples conexiones
-   for i in $(seq 1 5); do
-     curl -sk --connect-timeout 3 https://10.10.10.100/ 2>&1 | tail -1
-   done
-   ```
-
-3. Detenga la captura en BIG-IP:
-
-   ```bash
-   kill $TCPDUMP_PID
-   ls -la /var/tmp/capture_pre_fix.pcap
-   ```
-
-4. Descargue el archivo desde el cliente de administración:
-
-   ```bash
-   scp root@192.0.2.245:/var/tmp/capture_pre_fix.pcap /tmp/
-   ```
-
-5. Abra el archivo en Wireshark 4.2.5 y aplique los siguientes filtros de display:
-
-   ```
-   tcp.flags.reset == 1
-   tcp.analysis.retransmission
-   ```
-
-6. Documente las observaciones:
-   - ¿Se observan paquetes RST?
-   - ¿Hay intentos de handshake TCP que no se completan?
-   - ¿Hay evidencia de tráfico hacia los Pool Members?
-
-**Salida esperada:**
-
-- Con el VS deshabilitado, se esperan RST inmediatos o ausencia total de respuesta en la VIP `10.10.10.100:443`.
-- No debería haber tráfico hacia `10.20.20.11` ni `10.20.20.12` en la captura.
-- El archivo `.pcap` tendrá pocos paquetes, mayormente SYN del cliente y RST del BIG-IP (o ningún paquete si el VS no responde en absoluto).
-
-**Verificación:**
-
-- [ ] El archivo `capture_pre_fix.pcap` existe y tiene tamaño > 0 bytes.
-- [ ] Se documentaron las anomalías observadas en Wireshark (RST, retransmisiones, ausencia de respuesta).
-
----
-
-### Paso 5: Aplicar correcciones en orden de dependencia (FASE 4)
-
-**Objetivo:** Corregir las seis fallas en el orden correcto para evitar dependencias rotas: primero el Health Monitor (para que los members vuelvan a estar disponibles), luego el Pool (Priority Groups y Connection Limits), después los Profiles del Virtual Server, luego Persistence, y finalmente habilitar el Virtual Server.
-
-**Instrucciones:**
-
-#### 5a. Corregir Falla F3 — Health Monitor Receive String
-
-1. Corrija la Receive String:
-
-   ```bash
-   tmsh modify ltm monitor http mon_http_app recv "200 OK"
-   ```
-
-2. Espere 16 segundos (el timeout del monitor) y verifique que los members vuelvan a estar disponibles:
-
-   ```bash
-   sleep 20
-   tmsh show ltm pool pool_app members
-   ```
-
-3. **Resultado esperado:** Ambos members deben mostrar `Availability: available` (icono verde en TMUI).
-
-#### 5b. Corregir Falla F4 — Priority Group Activation threshold
-
-4. Corrija el threshold:
-
-   ```bash
-   tmsh modify ltm pool pool_app min-active-members 1
-   ```
-
-5. Verifique:
-
-   ```bash
-   tmsh list ltm pool pool_app min-active-members
-   ```
-
-6. **Resultado esperado:** `min-active-members 1`.
-
-#### 5c. Corregir Falla F5 — Connection Limit del Pool Member
-
-7. Elimine el límite de conexiones:
-
-   ```bash
-   tmsh modify ltm pool pool_app members { 10.20.20.11:80 { connection-limit 0 } }
-   ```
-
-8. Verifique:
-
-   ```bash
-   tmsh list ltm pool pool_app members { 10.20.20.11:80 }
-   ```
-
-9. **Resultado esperado:** `connection-limit 0`.
-
-#### 5d. Corregir Falla F2 — Restaurar HTTP Profile en el Virtual Server
-
-10. Agregue el HTTP Profile al Virtual Server:
-
-    ```bash
-    tmsh modify ltm virtual vs_app_https profiles add { http_app { context all } }
-    ```
-
-11. Verifique que ambos profiles (clientssl y http) estén presentes:
-
-    ```bash
-    tmsh list ltm virtual vs_app_https profiles
-    ```
-
-12. **Resultado esperado:** Se listan `clientssl_app` y `http_app`.
-
-#### 5e. Corregir Falla F6 — Cookie Name de Persistence
-
-13. Restaure el Cookie Name:
-
-    ```bash
-    tmsh modify ltm persistence cookie persist_cookie_app cookie-name "BIGipServer_pool_app"
-    ```
-
-14. Verifique:
-
-    ```bash
-    tmsh list ltm persistence cookie persist_cookie_app cookie-name
-    ```
-
-15. **Resultado esperado:** `cookie-name BIGipServer_pool_app`.
-
-#### 5f. Corregir Falla F1 — Habilitar el Virtual Server
-
-16. Habilite el Virtual Server (esta corrección se aplica al final para que todas las dependencias estén resueltas):
-
-    ```bash
-    tmsh modify ltm virtual vs_app_https enabled
-    ```
-
-17. Verifique el estado completo:
-
-    ```bash
-    tmsh show ltm virtual vs_app_https
-    ```
-
-18. **Resultado esperado:** `Availability: available`, `State: enabled`.
-
-#### 5g. Guardar la configuración
-
-19. Persista los cambios:
-
-    ```bash
-    tmsh save sys config
-    ```
-
-**Salida esperada general después de todas las correcciones:**
-
-```
-Ltm::Virtual Server: vs_app_https
-  Availability     : available
-  State            : enabled
-  Reason           : The virtual server is available
+```text
+list ltm pool pool_lab09 monitor
+show ltm pool pool_lab09 members
 ```
 
+**Debe verse:** `monitor mon_lab09_http`; ambos miembros `available` tras el ciclo del monitor. Si esto falla, verifica Send String (no introduzcas todavía la falla).
+
+**Inyectar la falla (GUI, 1 min):**
+
+5. **Local Traffic > Monitors > mon_lab09_http**. Cambia **Receive String** a `LAB09_NO_EXISTE` y pulsa **Update**.
+6. En TMSH consulta dos veces, con unos segundos de separación:
+
+```text
+list ltm monitor http mon_lab09_http recv
+show ltm pool pool_lab09 members
+show ltm virtual vs_lab09_standard
 ```
-Ltm::Pool: pool_app
-  Availability     : available
-  State            : enabled
-  Current Members  : 2
-  Active Members   : 2
+
+**Debe verse:** ambos miembros eventualmente `unavailable` / `offline` mientras el estado administrativo puede seguir `enabled`.
+
+**Confirmar desde Ubuntu (1 min):**
+
+```bash
+curl --noproxy '*' -v --max-time 5 http://10.1.3.200:8084/
 ```
 
-**Verificación:**
+**Anota el fallo real**: `Connection reset`, `timeout`, HTTP `503` u otro. No inventes la salida; depende de las políticas y el tipo de VS.
 
-- [ ] Cada corrección fue verificada individualmente con el comando `tmsh` correspondiente antes de pasar a la siguiente.
-- [ ] El Virtual Server muestra `available` y `enabled`.
-- [ ] Ambos Pool Members muestran `available` y `enabled`.
+**Corregir (GUI, 2 min):**
 
----
+7. Regresa a `mon_lab09_http` y devuelve **Receive String** a `200 OK`. **Update**.
+8. Verifica en TMSH `show ltm pool pool_lab09 members`; espera el siguiente sondeo si es necesario.
+9. Ubuntu:
 
-### Paso 6: Verificar el restablecimiento del servicio de extremo a extremo
+```bash
+curl --noproxy '*' -sS -o /dev/null -w 'HTTP %{http_code}\n' --max-time 5 http://10.1.3.200:8084/
+```
 
-**Objetivo:** Confirmar que la aplicación es accesible desde el cliente, que la cookie de persistence se inserta correctamente y que la distribución de carga funciona entre ambos Pool Members.
+**Debe verse:** miembros recuperados y `HTTP 200`.
 
-**Instrucciones:**
+**Pregunta de troubleshooting:** si Web01 y Web02 siguen vivos, ¿cómo puede un monitor con una Receive String incorrecta dejarlos Offline?
 
-1. Desde el cliente de pruebas, ejecute una solicitud HTTPS y examine los headers:
+### 7.2 Incidente B: el pool está sano pero el servicio no está publicado — 2 min
 
-   ```bash
-   curl -vk https://10.10.10.100/ 2>&1 | tee /tmp/curl_post_fix.txt
-   ```
+1. En TMSH: `show ltm pool pool_lab09 members` (ambos Available) y `show ltm virtual vs_lab09_standard` (habilitado).
+2. Desde **TMUI > Local Traffic > Virtual Servers > Virtual Server List**, selecciona **solo** `vs_lab09_standard` y pulsa **Disable**.
+3. En TMSH:
 
-2. Verifique que la respuesta sea HTTP 200 OK:
+```text
+show ltm virtual vs_lab09_standard
+show ltm pool pool_lab09 members
+```
 
-   ```bash
-   curl -sk -o /dev/null -w "%{http_code}\n" https://10.10.10.100/
-   ```
+**Qué ver:** `State: disabled` para el VS, pero el pool puede seguir mostrando dos miembros Available. Son **estados diferentes**.
 
-   **Resultado esperado:** `200`
+4. Desde Ubuntu ejecuta:
 
-3. Verifique que la cookie de persistence esté presente en la respuesta:
+```bash
+curl --noproxy '*' -v --connect-timeout 3 --max-time 5 http://10.1.3.200:8084/
+```
 
-   ```bash
-   curl -sk -D - https://10.10.10.100/ | grep -i "Set-Cookie"
-   ```
+**Qué registrar:** no se obtiene normalmente la misma respuesta del VS habilitado. El resultado exacto depende del comportamiento de BIG-IP y otros VS coincidentes.
 
-   **Resultado esperado:** Una línea que contenga `Set-Cookie: BIGipServer_pool_app=...`
+5. En TMUI pulsa **Enable** sobre `vs_lab09_standard` y comprueba desde Ubuntu:
 
-4. Verifique la tabla de persistence:
+```bash
+curl --noproxy '*' -sS -o /dev/null -w 'HTTP %{http_code}\n' http://10.1.3.200:8084/
+```
 
-   ```bash
-   tmsh show ltm persistence persist-records
-   ```
+**Debe verse:** `HTTP 200`.
 
-   **Resultado esperado:** Al menos un registro de persistence asociado al Pool `pool_app`.
-
-5. Genere carga con `ab` para verificar distribución de tráfico entre ambos members:
-
-   ```bash
-   ab -n 100 -c 10 -k https://10.10.10.100/
-   ```
-
-   > **Nota:** Si `ab` no soporta HTTPS directamente en su versión, use como alternativa:
-   > ```bash
-   > for i in $(seq 1 100); do curl -sk https://10.10.10.100/ > /dev/null; done
-   > ```
-
-6. Verifique las estadísticas de distribución en el Pool:
-
-   ```bash
-   tmsh show ltm pool pool_app members stats
-   ```
-
-7. Confirme que ambos members recibieron conexiones. Con Round Robin y sin persistence en las peticiones de `ab` (cada petición es una nueva conexión sin cookie), la distribución debería ser aproximadamente equitativa.
-
-8. Revise las estadísticas del Virtual Server post-corrección:
-
-   ```bash
-   tmsh show ltm virtual vs_app_https stats
-   ```
-
-   **Resultado esperado:** Contadores de `Total Requests`, `Bits In`, `Bits Out` y `Current Connections` con valores > 0.
-
-**Verificación:**
-
-- [ ] `curl` devuelve HTTP 200 OK.
-- [ ] La cookie `BIGipServer_pool_app` aparece en el header `Set-Cookie`.
-- [ ] La tabla de persistence contiene al menos un registro.
-- [ ] Ambos Pool Members muestran conexiones en sus estadísticas.
-- [ ] Las estadísticas del Virtual Server muestran tráfico procesado.
+| Incidente | Síntoma desde Ubuntu | Evidencia TMSH | Corrección GUI | Confirmación Ubuntu |
+|---|---|---|---|---|
+| Monitor incorrecto | | | | |
+| VS Disabled | | | | |
 
 ---
 
-### Paso 7: Capturar tráfico post-corrección y analizar en Wireshark
+## Etapa 8. Falla real de Client SSL y limpieza — 9 minutos
 
-**Objetivo:** Ejecutar una nueva captura de paquetes para contrastar con la captura pre-corrección y confirmar que el flujo cliente→VIP→Pool Member es correcto.
+**Problema real:** un cliente intenta entrar por HTTPS, pero el Virtual Server no tiene un perfil **Client SSL**. ¿Cómo distinguir un problema de TLS de una falla del pool? Vamos a observar **HTTPS correcto → fallo de negociación TLS → HTTPS recuperado**, sin modificar el servicio HTTPS del Laboratorio 5.
 
-**Instrucciones:**
+**Objetos exclusivos:** `vs_lab09_ssl` en `10.1.3.200:8444`. Se reutiliza **sin modificarlo** el perfil `clientssl_lab05` creado en el Laboratorio 5 y el `pool_lab09` creado aquí. **No se modifican los servidores**, que seguirán usando HTTP/80.
 
-1. Inicie la captura en BIG-IP:
+### 8.1 Preparar un HTTPS funcional — GUI + CLI + Ubuntu (2 min)
 
-   ```bash
-   tcpdump -ni 0.0 -s 0 -w /var/tmp/capture_post_fix.pcap host 10.10.10.100 &
-   TCPDUMP_PID=$!
+1. Desde TMSH confirma que el perfil Client SSL existe y consulta si el puerto ya está ocupado:
+
+   ```text
+   list ltm profile client-ssl clientssl_lab05
+   list ltm virtual
    ```
 
-2. Genere tráfico desde el cliente:
+   **Debes encontrar** `clientssl_lab05` y comprobar que ningún Virtual Server utiliza ya `10.1.3.200:8444`. Si el perfil no existe, no inventes un certificado: reutiliza el perfil Client SSL válido que esté asociado a `vs_lab05_https` (consulta `list ltm virtual vs_lab05_https profiles`). Si `8444` está ocupado, el instructor debe asignar un puerto libre antes de continuar.
 
-   ```bash
-   curl -vk https://10.10.10.100/ 2>&1 > /dev/null
-   curl -vk https://10.10.10.100/ 2>&1 > /dev/null
-   curl -vk https://10.10.10.100/ 2>&1 > /dev/null
-   ```
+2. En TMUI entra en **Local Traffic > Virtual Servers > Virtual Server List > Create** y configura:
 
-3. Detenga la captura:
-
-   ```bash
-   kill $TCPDUMP_PID
-   ```
-
-4. Descargue y abra en Wireshark 4.2.5:
-
-   ```bash
-   scp root@192.0.2.245:/var/tmp/capture_post_fix.pcap /tmp/
-   ```
-
-5. En Wireshark, aplique los siguientes filtros y documente los hallazgos:
-
-   | Filtro de display | Qué buscar | Resultado esperado |
-   |---|---|---|
-   | `tcp.flags.reset == 1` | RST inesperados | Ninguno o mínimos (solo cierres normales) |
-   | `ssl.handshake` | TLS handshake completo | Client Hello → Server Hello → Certificate → ... → Finished |
-   | `http.cookie contains "BIGipServer"` | Cookie de persistence | Presente en requests del cliente |
-   | `ip.dst == 10.20.20.11 or ip.dst == 10.20.20.12` | Tráfico hacia backends | Paquetes hacia ambos servers |
-
-6. Compare con la captura pre-corrección:
-   - Pre-corrección: RST o ausencia de respuesta.
-   - Post-corrección: handshake TLS completo, HTTP 200, cookies de persistence.
-
-**Salida esperada:**
-
-En la captura post-corrección se observa:
-- TCP three-way handshake exitoso entre cliente y VIP.
-- TLS handshake completo.
-- Tráfico HTTP entre BIG-IP y los Pool Members en la VLAN interna.
-- Cookie `BIGipServer_pool_app` en los headers HTTP.
-
-**Verificación:**
-
-- [ ] La captura post-corrección muestra handshakes TLS completos (sin RST prematuros).
-- [ ] Se identifica tráfico hacia ambos Pool Members (`10.20.20.11` y `10.20.20.12`).
-- [ ] La cookie de persistence es visible en el análisis HTTP de Wireshark.
-
----
-
-### Paso 8: Registrar línea base post-corrección y comparar recursos
-
-**Objetivo:** Capturar métricas de utilización de recursos después de las correcciones y compararlas con la línea base del Paso 1 para confirmar que las fallas no dejaron impacto residual.
-
-**Instrucciones:**
-
-1. Capture las métricas post-corrección:
-
-   ```bash
-   tmsh show sys performance all-stats > /var/tmp/baseline_post.txt
-   tmsh show sys memory >> /var/tmp/baseline_post.txt
-   tmsh show sys disk logical-disk >> /var/tmp/baseline_post.txt
-   tmsh show net interface all-properties >> /var/tmp/baseline_post.txt
-   tmsh show ltm virtual vs_app_https stats >> /var/tmp/baseline_post.txt
-   echo "--- Post-corrección: $(date) ---" >> /var/tmp/baseline_post.txt
-   ```
-
-2. Compare las métricas clave:
-
-   ```bash
-   echo "=== CPU PRE ===" && grep -i "tmm" /var/tmp/baseline_pre.txt | head -5
-   echo "=== CPU POST ===" && grep -i "tmm" /var/tmp/baseline_post.txt | head -5
-   ```
-
-3. Verifique el estado de las interfaces:
-
-   ```bash
-   tmsh show net interface 1.1
-   tmsh show net interface 1.2
-   ```
-
-4. Confirme que no hay errores ni drops nuevos en las interfaces:
-
-   | Interfaz | Errors In (pre) | Errors In (post) | Drops (pre) | Drops (post) |
-   |---|---|---|---|---|
-   | 1.1 | | | | |
-   | 1.2 | | | | |
-
-5. Documente la comparación:
-   - TMM CPU: ¿incremento esperado después de procesar tráfico? (Sí, es normal un leve incremento.)
-   - Memoria: ¿cambio significativo? (No debería haber cambio relevante en un entorno de laboratorio.)
-   - Disco: ¿se generaron archivos de captura que ocupen espacio? (Sí, los `.pcap` y la futura QKView.)
-
-**Salida esperada:**
-
-Las métricas post-corrección deben mostrar:
-- TMM CPU con un leve incremento respecto al estado pre-corrección (ahora procesa tráfico activamente).
-- Memoria sin cambios significativos.
-- Disco con los archivos de captura adicionales pero sin presión de espacio.
-- Interfaces sin errores nuevos.
-
-**Verificación:**
-
-- [ ] Los archivos `baseline_pre.txt` y `baseline_post.txt` existen en `/var/tmp/`.
-- [ ] Se documentó la comparación de al menos CPU TMM, memoria y estado de interfaces.
-- [ ] No se detectaron errores ni drops anómalos en las interfaces.
-
----
-
-### Paso 9: Generar QKView y subir a iHealth (FASE 5)
-
-**Objetivo:** Generar un archivo QKView del estado actual del BIG-IP y subirlo a F5 iHealth para obtener diagnósticos automatizados.
-
-**Instrucciones:**
-
-1. Genere el QKView desde SSH:
-
-   ```bash
-   qkview -f /var/tmp/lab9.qkview
-   ```
-
-   > **Nota:** La generación puede tomar 2–5 minutos. No interrumpa el proceso.
-
-2. Verifique que el archivo se generó correctamente:
-
-   ```bash
-   ls -lh /var/tmp/lab9.qkview
-   ```
-
-   **Resultado esperado:** Un archivo de entre 30 MB y 200 MB.
-
-3. Descargue el archivo al cliente de administración:
-
-   ```bash
-   scp root@192.0.2.245:/var/tmp/lab9.qkview /tmp/
-   ```
-
-4. Acceda a F5 iHealth desde el navegador:
-
-   ```
-   https://ihealth.f5.com
-   ```
-
-5. Inicie sesión con su cuenta F5 registrada.
-
-6. Suba el archivo `lab9.qkview` mediante la opción **Upload QKView**.
-
-7. Una vez procesado (puede tomar 2–10 minutos), revise la sección **Diagnostics** y busque:
-
-   | Diagnóstico esperado | Relación con falla del laboratorio |
+   | Campo | Valor que debes seleccionar |
    |---|---|
-   | Advertencias sobre configuración de monitors | Relacionado con F3 (si el QKView se generó antes de la corrección) o ausencia de advertencia (si se generó después) |
-   | Advertencias sobre Connection Limits muy bajos | Relacionado con F5 |
-   | Advertencias sobre Persistence Profile | Relacionado con F6 |
-   | Estado general del sistema (CPU, memoria) | Línea base de recursos |
+   | Name | `vs_lab09_ssl` |
+   | Type | `Standard` |
+   | Destination Address | `10.1.3.200` |
+   | Service Port | `8444` (Other / especificar) |
+   | Protocol | `TCP` |
+   | HTTP Profile | `http` |
+   | SSL Profile (Client) | `clientssl_lab05` (o el perfil verificado) |
+   | SSL Profile (Server) | `None` |
+   | Source Address Translation | `Auto Map` |
+   | Default Pool | `pool_lab09` |
 
-   > **Nota:** Dado que el QKView se genera **después** de las correcciones, iHealth puede no mostrar las fallas originales. Sin embargo, debería mostrar diagnósticos generales sobre la configuración, versión de software y mejores prácticas. Documente al menos **dos diagnósticos** que iHealth presente, aunque sean recomendaciones generales.
+   Pulsa **Finished**. No adjuntes iRules de laboratorios anteriores.
 
-8. Si iHealth muestra heurísticas (por ejemplo, recomendaciones de versión de software, configuración de NTP, o parámetros de monitor), documente:
+3. En TMSH consulta:
 
-   | # | Diagnóstico iHealth | Severidad | Descripción | Acción recomendada |
-   |---|---|---|---|---|
-   | 1 | | | | |
-   | 2 | | | | |
+   ```text
+   list ltm virtual vs_lab09_ssl profiles
+   show ltm virtual vs_lab09_ssl
+   show ltm pool pool_lab09 members
+   ```
 
-**Salida esperada:**
+   **Debes identificar:** el perfil `clientssl_lab05`, el perfil `http`, el VS habilitado y los dos miembros del pool disponibles.
 
-- Archivo `lab9.qkview` generado exitosamente.
-- Al menos dos diagnósticos documentados de iHealth.
+4. Desde **Ubuntu** confirma el funcionamiento:
 
-**Verificación:**
+   ```bash
+   curl --noproxy '*' -k -sS -o /dev/null -w 'HTTPS inicial: %{http_code}\n' --max-time 5 https://10.1.3.200:8444/
+   ```
 
-- [ ] El archivo QKView existe y tiene tamaño razonable (>30 MB).
-- [ ] El QKView fue subido exitosamente a iHealth.
-- [ ] Se documentaron al menos dos diagnósticos de iHealth con su severidad y descripción.
+   **Esperado:** `HTTPS inicial: 200`. El parámetro `-k` únicamente omite la verificación de confianza del certificado de laboratorio; **no** omite la negociación TLS. No continúes si todavía no obtienes `200`.
+
+### 8.2 Provocar la falla SSL — GUI + CLI + Ubuntu (2 min)
+
+1. En TMUI abre **Local Traffic > Virtual Servers > vs_lab09_ssl > Properties**.
+2. Cambia **SSL Profile (Client)**: retira `clientssl_lab05` de los perfiles seleccionados y deja ese campo en **None**. Mantén el perfil `http`, `pool_lab09` y `Auto Map` sin cambios. Pulsa **Update**.
+3. En TMSH verifica el cambio:
+
+   ```text
+   list ltm virtual vs_lab09_ssl profiles
+   show ltm pool pool_lab09 members
+   ```
+
+   **Debes observar:** `clientssl_lab05` ya **no** está asociado al VS, mientras que el pool conserva miembros disponibles. Por tanto, la falla no se debe atribuir a Web01/Web02.
+
+4. Desde Ubuntu ejecuta la misma solicitud HTTPS:
+
+   ```bash
+   curl --noproxy '*' -k -v --connect-timeout 3 --max-time 5 https://10.1.3.200:8444/
+   ```
+
+   **Esperado:** ya **no** se obtiene una respuesta HTTPS válida con HTTP 200. Puede aparecer un error de protocolo SSL, cierre de conexión o mensaje equivalente según el comportamiento del Virtual Server. **Anota literalmente el mensaje**; no se garantiza una cadena específica de error.
+
+   **Interpretación:** un servidor backend puede seguir *Available* mientras la conexión HTTPS falla porque BIG-IP dejó de terminar TLS. `curl -k` no arregla la ausencia de un perfil Client SSL.
+
+### 8.3 Corregir la causa y comprobar recuperación — GUI + CLI + Ubuntu (2 min)
+
+1. Vuelve a **vs_lab09_ssl > Properties > SSL Profile (Client)**.
+2. Añade otra vez **`clientssl_lab05`** (o el perfil identificado inicialmente) y pulsa **Update**.
+3. En TMSH confirma:
+
+   ```text
+   list ltm virtual vs_lab09_ssl profiles
+   ```
+
+   **Debes ver:** el perfil Client SSL nuevamente asociado.
+
+4. Desde Ubuntu repite exactamente la prueba:
+
+   ```bash
+   curl --noproxy '*' -k -sS -o /dev/null -w 'HTTPS recuperado: %{http_code}\n' --max-time 5 https://10.1.3.200:8444/
+   ```
+
+   **Esperado:** `HTTPS recuperado: 200`.
+
+5. Responde: ¿por qué es un fallo de **Client SSL** y no de **Server SSL**? Porque el error se produjo antes de poder procesar correctamente HTTP del cliente; el backend permanece en HTTP/80. **El tráfico BIG-IP → Web01/Web02 no está cifrado en esta prueba**.
+
+### 8.4 Limpieza y validación del entorno — GUI + CLI (3 min)
+
+1. En TMUI elimina **únicamente** los Virtual Servers del Lab 9: `vs_lab09_ssl`, `vs_lab09_standard`, `vs_lab09_fastl4`, `vs_lab09_reject` y, si se crearon, `vs_lab09_especifico` y `vs_lab09_wildcard`.
+2. Elimina **`pool_lab09`** desde **Local Traffic > Pools**.
+3. Elimina los objetos exclusivos desde sus secciones de TMUI: perfil Cookie `persist_cookie_lab09`, perfil TCP `tcp_lab09_corto` y monitor `mon_lab09_http` (si fueron creados). **No elimines `clientssl_lab05`: pertenece al Lab 5.**
+4. Desde TMSH comprueba que los objetos exclusivos ya no existen:
+
+   ```text
+   list ltm virtual vs_lab09_ssl
+   list ltm virtual vs_lab09_standard
+   list ltm pool pool_lab09
+   ```
+
+   **Esperado:** un mensaje equivalente a `not found`, porque ya fueron eliminados.
+
+5. Desde Ubuntu confirma que el servicio HTTPS del Lab 5 sigue funcionando:
+
+   ```bash
+   curl --noproxy '*' -k -sS -o /dev/null -w 'Lab05 HTTPS: %{http_code}\n' --max-time 5 https://10.1.3.200:8443/
+   ```
+
+   **Esperado:** `Lab05 HTTPS: 200`, si el servicio se mantuvo activo. Si no lo está, verifica su estado en TMSH; no modifiques la configuración del Lab 5 para resolver problemas del Lab 9.
+
+**Registro mínimo durante la actividad (sin entregable adicional):** `HTTPS inicial 200` → error real de TLS `________` → `HTTPS recuperado 200` → `Lab05 HTTPS 200`.
 
 ---
 
-### Paso 10: Completar la hoja de registro de troubleshooting
-
-**Objetivo:** Consolidar toda la documentación del laboratorio en una hoja de registro estructurada que sirva como evidencia de la resolución completa del escenario.
-
-**Instrucciones:**
-
-1. Complete la siguiente tabla para cada una de las seis fallas:
-
-   | # | Síntoma observado | Componente afectado | Comando de detección | Causa raíz | Acción correctiva (comando) | Verificación (comando y resultado) |
-   |---|---|---|---|---|---|---|
-   | F1 | VS no acepta conexiones; icono negro en Network Map | Virtual Server `vs_app_https` | `tmsh show ltm virtual vs_app_https` → State: disabled | Estado administrativo cambiado a Disabled | `tmsh modify ltm virtual vs_app_https enabled` | `tmsh show ltm virtual vs_app_https` → State: enabled, Availability: available |
-   | F2 | Sin procesamiento L7; cookie persistence no se inserta | Virtual Server Profiles | `tmsh list ltm virtual vs_app_https profiles` → `http_app` ausente | HTTP Profile eliminado del VS | `tmsh modify ltm virtual vs_app_https profiles add { http_app { context all } }` | `tmsh list ltm virtual vs_app_https profiles` → `http_app` presente |
-   | F3 | Todos los Pool Members marcados Offline (rojo) | Health Monitor `mon_http_app` | `tmsh list ltm monitor http mon_http_app` → recv `"404 Not Found"` | Receive String no coincide con respuesta real del backend (200 OK) | `tmsh modify ltm monitor http mon_http_app recv "200 OK"` | `tmsh show ltm pool pool_app members` → Availability: available |
-   | F4 | Priority Group no activa correctamente | Pool `pool_app` | `tmsh list ltm pool pool_app min-active-members` → 99 | Threshold inalcanzable con 2 members | `tmsh modify ltm pool pool_app min-active-members 1` | `tmsh list ltm pool pool_app min-active-members` → 1 |
-   | F5 | Distribución de carga desequilibrada; member rechaza conexiones | Pool Member `10.20.20.11:80` | `tmsh list ltm pool pool_app members` → connection-limit 1 | Connection Limit demasiado restrictivo | `tmsh modify ltm pool pool_app members { 10.20.20.11:80 { connection-limit 0 } }` | `tmsh list ltm pool pool_app members { 10.20.20.11:80 }` → connection-limit 0 |
-   | F6 | Cookie de persistence no se inserta en respuestas | Persistence Profile `persist_cookie_app` | `tmsh list ltm persistence cookie persist_cookie_app cookie-name` → `""` | Cookie Name vacío | `tmsh modify ltm persistence cookie persist_cookie_app cookie-name "BIGipServer_pool_app"` | `curl -sk -D - https://10.10.10.100/` → `Set-Cookie: BIGipServer_pool_app=...` |
-
-2. Revise los logs finales para confirmar que no hay errores residuales:
-
-   ```bash
-   tail -50 /var/log/ltm | grep -iE "error|fail|down"
-   ```
-
-   **Resultado esperado:** Sin mensajes de error recientes (o solo mensajes históricos del periodo de fallas).
-
-3. Realice una verificación final completa:
-
-   ```bash
-   # Estado del Virtual Server
-   tmsh show ltm virtual vs_app_https
-
-   # Estado del Pool y members
-   tmsh show ltm pool pool_app
-   tmsh show ltm pool pool_app members
-
-   # Tabla de persistence (después de generar tráfico)
-   curl -sk https://10.10.10.100/ > /dev/null
-   tmsh show ltm persistence persist-records
-
-   # Estadísticas finales
-   tmsh show ltm virtual vs_app_https stats
-   tmsh show ltm pool pool_app stats
-   ```
-
-**Salida esperada:**
-
-Todos los objetos en estado `available` y `enabled`. Estadísticas con tráfico procesado. Tabla de persistence con registros activos. Sin errores en logs.
-
-**Verificación:**
-
-- [ ] La hoja de registro de las 6 fallas está completa con todos los campos.
-- [ ] La verificación final muestra todos los objetos en estado operativo.
-- [ ] Los logs no muestran errores residuales.
-
----
-
-## Validación y Pruebas
-
-### Criterios de éxito medibles
-
-| # | Criterio | Evidencia requerida | Resultado |
-|---|---|---|---|
-| V1 | Las 6 fallas fueron identificadas correctamente | Tabla de hallazgos del Paso 3 completada con los 6 componentes y valores incorrectos | ☐ |
-| V2 | `curl -sk https://10.10.10.100/` devuelve HTTP 200 | Salida del comando mostrando código 200 | ☐ |
-| V3 | Cookie de persistence presente en respuesta | Header `Set-Cookie: BIGipServer_pool_app=...` en salida de `curl -D -` | ☐ |
-| V4 | Ambos Pool Members reciben tráfico | `tmsh show ltm pool pool_app members stats` muestra conexiones > 0 en ambos members | ☐ |
-| V5 | Captura post-corrección muestra TLS handshake completo | Archivo `.pcap` analizado en Wireshark con filtro `ssl.handshake` mostrando secuencia completa | ☐ |
-| V6 | QKView generado y subido a iHealth | Archivo `lab9.qkview` en `/var/tmp/` y captura de pantalla de iHealth con diagnósticos | ☐ |
-| V7 | Línea base pre y post documentada | Archivos `baseline_pre.txt` y `baseline_post.txt` con datos de CPU, memoria, disco e interfaces | ☐ |
-| V8 | Hoja de registro completa con las 6 fallas | Tabla con síntoma, componente, causa raíz, corrección y verificación para cada falla | ☐ |
-
-### Caso adverso: información contradictoria en logs
-
-Durante el proceso de troubleshooting, es posible que los logs en `/var/log/ltm` muestren mensajes que aparenten señalar una causa raíz diferente a la real. Por ejemplo:
-
-- Un mensaje de `pool member 10.20.20.11:80 monitor status down` podría llevar a sospechar un problema en el servidor web, cuando la causa real es la Receive String incorrecta del monitor (F3).
-- Un mensaje de conexión rechazada podría atribuirse a un firewall, cuando la causa es el VS deshabilitado (F1).
-
-**Instrucción de validación adversa:** Antes de dar por cerrada cada falla, el estudiante debe **confirmar la causa raíz con al menos dos fuentes independientes** (por ejemplo, el comando `tmsh list` del objeto + una prueba directa contra el backend). No se debe aceptar una corrección basada únicamente en la desaparición del síntoma sin verificar que la causa raíz fue eliminada.
-
-**Ejemplo de validación cruzada para F3:**
-
-```bash
-## Fuente 1: Configuración del monitor
-tmsh list ltm monitor http mon_http_app recv
-## Debe mostrar "200 OK"
-
-## Fuente 2: Respuesta real del backend
-curl -s -o /dev/null -w "%{http_code}" http://10.20.20.11/
-## Debe mostrar 200
-
-## Fuente 3: Estado del member después de la corrección
-tmsh show ltm pool pool_app members { 10.20.20.11:80 }
-## Debe mostrar Availability: available
-```
-
-## Solución de Problemas
-
-### Problema 1: Después de corregir F1 (habilitar VS), el Virtual Server muestra `available` pero `curl` sigue fallando con "Connection refused"
-
-**Síntomas:**
-- `tmsh show ltm virtual vs_app_https` muestra `State: enabled`, `Availability: available`.
-- `curl -vk https://10.10.10.100/` devuelve `curl: (7) Failed to connect to 10.10.10.100 port 443: Connection refused`.
-- El Pool muestra members disponibles.
-
-**Causa:**
-El HTTP Profile (F2) no fue restaurado antes de habilitar el VS, o se agregó con un contexto incorrecto. Cuando un VS tipo HTTPS tiene un Client SSL Profile pero carece de HTTP Profile, puede aceptar la conexión TLS pero fallar al procesar la petición HTTP, resultando en un cierre abrupto que el cliente percibe como rechazo. Otra causa posible es que el orden de corrección no fue respetado y el VS fue habilitado mientras el Pool aún no tenía members disponibles (F3 sin corregir), lo que puede hacer que el VS entre en estado `available` brevemente y luego caiga.
-
-**Solución:**
-
-1. Verifique que el HTTP Profile está asignado:
-
-   ```bash
-   tmsh list ltm virtual vs_app_https profiles
-   ```
-
-2. Si no aparece `http_app`, agréguelo:
-
-   ```bash
-   tmsh modify ltm virtual vs_app_https profiles add { http_app { context all } }
-   ```
-
-3. Verifique que el Pool tiene members disponibles:
-
-   ```bash
-   tmsh show ltm pool pool_app members
-   ```
-
-4. Si los members están offline, corrija primero el monitor (F3) y espere el ciclo de verificación.
-
-5. Repita la prueba:
-
-   ```bash
-   curl -vk https://10.10.10.100/
-   ```
-
----
-
-### Problema 2: Los Pool Members aparecen `available` después de corregir F3, pero solo uno recibe tráfico
-
-**Síntomas:**
-- `tmsh show ltm pool pool_app members` muestra ambos members como `available`.
-- Después de 100 requests con `curl`, `tmsh show ltm pool pool_app members stats` muestra que `10.20.20.11:80` tiene 1 conexión total y `10.20.20.12:80` tiene 99 conexiones.
-- El método de LB es Round Robin.
-
-**Causa:**
-La falla F5 (Connection Limit = 1 en `10.20.20.11:80`) no fue corregida. Con un límite de 1 conexión concurrente, el member acepta la primera conexión pero rechaza todas las siguientes mientras esa conexión esté activa. Con conexiones HTTP keep-alive o si las conexiones se solapan, el efecto es que casi todo el tráfico se dirige al otro member. Adicionalmente, si la falla F4 (Priority Group Activation threshold = 99) tampoco fue corregida, el comportamiento de selección de members puede ser impredecible.
-
-**Solución:**
-
-1. Verifique el Connection Limit:
-
-   ```bash
-   tmsh list ltm pool pool_app members { 10.20.20.11:80 } connection-limit
-   ```
-
-2. Si el valor es diferente de `0`, corríjalo:
-
-   ```bash
-   tmsh modify ltm pool pool_app members { 10.20.20.11:80 { connection-limit 0 } }
-   ```
-
-3. Verifique también el Priority Group Activation threshold:
-
-   ```bash
-   tmsh list ltm pool pool_app min-active-members
-   ```
-
-4. Si el valor es diferente de `1`, corríjalo:
-
-   ```bash
-   tmsh modify ltm pool pool_app min-active-members 1
-   ```
-
-5. Reinicie las estadísticas para una prueba limpia:
-
-   ```bash
-   tmsh reset-stats ltm pool pool_app
-   ```
-
-6. Repita la prueba de carga y verifique distribución equitativa:
-
-   ```bash
-   for i in $(seq 1 50); do curl -sk https://10.10.10.100/ > /dev/null; done
-   tmsh show ltm pool pool_app members stats
-   ```
-
-## Limpieza
-
-> **IMPORTANTE:** Este es el último laboratorio del curso. La limpieza es opcional y depende de si el entorno será reutilizado.
-
-1. **Si el entorno será reutilizado para otra cohorte**, restaure las fallas para el siguiente grupo de estudiantes ejecutando los comandos de inyección de la sección "Comandos de inyección de fallas" del instructor.
-
-2. **Elimine los archivos temporales** generados durante el laboratorio:
-
-   ```bash
-   rm -f /var/tmp/capture_pre_fix.pcap
-   rm -f /var/tmp/capture_post_fix.pcap
-   rm -f /var/tmp/baseline_pre.txt
-   rm -f /var/tmp/baseline_post.txt
-   rm -f /var/tmp/lab9.qkview
-   ```
-
-3. **Verifique el espacio de disco** después de la limpieza:
-
-   ```bash
-   tmsh show sys disk logical-disk
-   ```
-
-4. **Si el entorno será destruido**, no se requiere acción adicional. Documente el estado final del laboratorio para referencia del instructor.
-
-## Resumen
-
-En este laboratorio se aplicó la metodología sistemática de troubleshooting de cinco fases para resolver un escenario con seis fallas inyectadas simultáneamente en un entorno BIG-IP. Los puntos clave consolidados son:
-
-- **Identificación estructurada:** El Network Map de TMUI y las pruebas de conectividad con `curl` proporcionan una primera vista rápida del estado del servicio, pero no son suficientes para determinar causas raíz.
-- **Inspección jerárquica:** Recorrer la cadena Virtual Server → Pool → Pool Members → Health Monitor → Persistence → Profiles permite aislar fallas sin saltar a conclusiones. Cada nivel puede enmascarar o amplificar problemas de niveles inferiores.
-- **Orden de corrección:** Las dependencias entre objetos BIG-IP exigen un orden de corrección deliberado. Habilitar un VS antes de que su Pool tenga members disponibles puede generar síntomas confusos adicionales.
-- **Evidencia cruzada:** Cada falla debe confirmarse con al menos dos fuentes independientes (`tmsh list`, `tmsh show`, prueba directa al backend, logs) para evitar diagnósticos incorrectos basados en correlaciones espurias.
-- **Utilización de recursos:** La comparación de líneas base pre y post-corrección permite cuantificar el impacto de las fallas en CPU, memoria e interfaces, y confirmar que no quedan efectos residuales.
-- **Documentación operativa:** El QKView y la hoja de registro de troubleshooting son entregables profesionales que permiten auditar el proceso de resolución y transferir conocimiento al equipo.
-
-### Recursos adicionales
-
-| Recurso | URL |
-|---|---|
-| Documentación F5 BIG-IP LTM 17.1 | [https://techdocs.f5.com/en-us/bigip-17-1-0.html](https://techdocs.f5.com/en-us/bigip-17-1-0.html) |
-| Referencia de comandos TMSH | [https://clouddocs.f5.com/cli/tmsh-reference/latest/](https://clouddocs.f5.com/cli/tmsh-reference/latest/) |
-| F5 iHealth | [https://ihealth.f5.com](https://ihealth.f5.com) |
-| K12878: Generación de QKView | [https://my.f5.com/manage/s/article/K12878](https://my.f5.com/manage/s/article/K12878) |
-| K13637: Troubleshooting de Health Monitors | [https://my.f5.com/manage/s/article/K13637](https://my.f5.com/manage/s/article/K13637) |
-| K411: Troubleshooting de Pool Members | [https://my.f5.com/manage/s/article/K411](https://my.f5.com/manage/s/article/K411) |
+## Solucionario breve — autoevaluación
+
+1. **TCP Idle Timeout:** después de 5 s de inactividad una conexión nueva sometida al perfil puede cerrarse. Una solicitud de 2 s funciona; otra de 9 s debería fallar, siempre que el perfil sea efectivamente usado y no exista otro timeout que altere la prueba.
+2. **Priority Group Activation:** el método Round Robin opera dentro de los miembros elegibles del grupo activo; una prioridad superior puede excluir al grupo de respaldo mientras permanezca disponible.
+3. **Forced Offline del miembro del pool:** evita seleccionar ese miembro para conexiones nuevas y permite comprobar el cambio de backend sin modificar el nodo utilizado por otros laboratorios. No prueba por sí solo *Action on Service Down* sobre sesiones existentes.
+4. **Cookie Insert:** BIG-IP agrega `Set-Cookie`; el navegador o `curl -b` lo devuelve y BIG-IP puede mantener la elección del mismo backend entre conexiones diferentes.
+5. **Monitor defectuoso:** un servidor puede devolver HTTP 200 y aun así ser marcado Offline cuando el monitor espera un patrón inexistente.
+6. **VS Disabled:** que el pool esté Available no significa que el VS esté habilitado.
+7. **Client SSL ausente:** un Virtual Server puede tener el pool disponible y aun así no poder negociar HTTPS con el cliente. Restaurar el perfil Client SSL permite recuperar la terminación TLS; no implica cifrado hacia servidores HTTP/80.
+
+## Alcance consciente de la infraestructura
+
+- **SSL:** en la Etapa 8 se demuestra realmente la falla y recuperación de **Client SSL**. **Server SSL hacia los backends** requiere un endpoint HTTPS y no se demuestra con Web01/Web02 que solo sirven HTTP/80.
+- **Action on Service Down:** requiere una conexión en curso y un cambio real de disponibilidad mientras esa conexión existe. La conmutación *Forced Offline* demuestra selección de miembros para conexiones nuevas, no ese mecanismo.
+- **Wildcard en Etapa 3:** únicamente se ejecuta si `10.1.3.201` está libre/reservada para la clase. No se crea un wildcard que intercepte puertos de otros laboratorios.
+
+## Referencias técnicas
+
+- [F5 — Configuring HTTP Load Balancing with Cookie Persistence](https://techdocs.f5.com/en-us/bigip-15-0-0/big-ip-local-traffic-manager-implementations/configuring-http-load-balancing-with-cookie-persistence.html)
+- [F5 — Pool `min-active-members` y grupos de prioridad](https://clouddocs.f5.com/cli/tmsh-reference/v14/modules/ltm/ltm_pool.html)
+- [F5 — Session Persistence Profiles](https://techdocs.f5.com/kb/en-us/products/big-ip_ltm/manuals/product/ltm-concepts-11-5-1/11.html)

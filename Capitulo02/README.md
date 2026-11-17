@@ -4,964 +4,538 @@
 
 | Campo | Valor |
 |---|---|
-| **Duración** | 70 minutos |
-| **Complejidad** | Media |
-| **Nivel Bloom** | Aplicar (Apply) |
+| **Duración** | **70 minutos** (con servidores web y conectividad preparados) |
+| **Complejidad** | Media-alta |
+| **Nivel de Bloom** | Aplicar y analizar |
+| **Modalidad** | Práctica individual: un pod Azure por estudiante |
+| **Producto** | F5 BIG-IP VE; comprobar versión instalada con `show sys version` |
+| **Continuidad** | Laboratorios 1 y 2 completados; redes e interfaces ya aprovisionadas |
 
-## Descripción General
+## Descripción general
 
-En este laboratorio se construye de forma incremental el camino de datos completo de un BIG-IP VE 17.1.2 partiendo de una configuración de fábrica con solo la Management IP operativa. El estudiante creará VLANs, Self IPs, una ruta estática, un pool con monitor de salud HTTP y un Virtual Server de tipo Standard, verificando cada objeto mediante TMUI y tmsh. Finalmente, se analizará el flujo de tráfico extremo a extremo con `tcpdump` para evidenciar el comportamiento full-proxy de BIG-IP, correlacionando las traducciones de dirección IP observadas con la arquitectura de doble conexión cliente–BIG-IP–servidor.
+En esta práctica se configura un servicio de balanceo HTTP funcional sobre una topología BIG-IP VE ya desplegada en Azure. El estudiante comprueba el camino de datos existente, crea un monitor de salud, incorpora dos servidores a un pool y publica el servicio mediante un **Virtual Server Standard** con **SNAT AutoMap**. Después genera tráfico, analiza las conexiones cliente y servidor con `tcpdump` y realiza una prueba de continuidad de servicio al deshabilitar temporalmente un miembro del pool.
 
-## Objetivos de Aprendizaje
+El aprendizaje principal no consiste en repetir la configuración de red del laboratorio anterior, sino en **demostrar por qué el balanceo funciona, identificar qué IP ve cada extremo y diagnosticar qué sucede cuando se retira un backend**.
 
-Al completar este laboratorio, serás capaz de:
+## Objetivos de aprendizaje
 
-- [ ] Verificar el estado operativo de las interfaces físicas/virtuales de BIG-IP (Management, 1.1, 1.2) y comprender su rol en la segmentación del plano de datos.
-- [ ] Crear VLANs, Self IPs con port lockdown apropiado y una ruta estática por defecto que habiliten la comunicación bidireccional entre los segmentos external e internal.
-- [ ] Construir un Virtual Server de tipo Standard con un pool de servidores backend y un health monitor HTTP, verificando que todos los objetos alcancen estado Available (verde).
-- [ ] Analizar capturas de tráfico simultáneas en las interfaces external e internal con `tcpdump`, identificando las traducciones de IP que evidencian el comportamiento full-proxy y SNAT AutoMap de BIG-IP.
-- [ ] Relacionar el estado de cada componente del camino de datos con la disponibilidad del servicio, identificando puntos únicos de fallo.
+Al finalizar podrás:
+
+- [ ] Verificar la conectividad de las redes existentes y explicar cuándo se necesita —o no— una ruta estática.
+- [ ] Crear y validar un monitor HTTP y un pool con dos miembros.
+- [ ] Publicar un Virtual Server Standard con perfiles TCP y HTTP, Round Robin y SNAT AutoMap.
+- [ ] Demostrar el reparto de nuevas conexiones y examinar estadísticas del Virtual Server y del pool.
+- [ ] Interpretar el flujo **cliente → VIP** y **Self IP interna → servidor** en una captura de paquetes.
+- [ ] Deshabilitar temporalmente un miembro, verificar continuidad y restaurar el estado original.
 
 ## Prerrequisitos
 
-### Conocimientos previos
+**Conocimientos:** TCP/IP, subredes, puertos TCP, HTTP, diferencia entre monitoreo de salud y distribución de conexiones.
 
-| Área | Detalle |
-|---|---|
-| TCP/IP | Modelo OSI capas 2–3, direccionamiento IPv4, subnetting CIDR |
-| VLANs | IEEE 802.1Q: concepto de tagged vs. untagged, segmentación de red |
-| Routing | Tablas de routing, rutas por defecto (0.0.0.0/0), concepto de gateway |
-| HTTP | Modelo request-response, puerto TCP/80, cabeceras básicas |
-| Lectura teórica | Temas 2.1 a 2.5 del Módulo 2 del curso completados |
+**Estado del pod:** BIG-IP operativo, licencia LTM activa, Management IP accesible, VLAN `External` con Self IP `External-IP` y VLAN `Internal` con su Self IP ya creada. Los servidores web están encendidos y atienden HTTP en TCP/80. El estudiante **no requiere acceso a Azure Portal** ni credenciales administrativas de los servidores web.
 
-### Acceso requerido
+**Acceso:** desde el equipo Windows del estudiante, TMUI y SSH/PuTTY a la IP pública asignada a **su** pod; desde Ubuntu gráfico, Firefox/terminal al BIG-IP por la Management IP privada. Se recomienda efectuar las pruebas de carga desde Ubuntu.
 
-| Recurso | Credenciales / Conectividad |
-|---|---|
-| BIG-IP VE Management GUI | `https://192.0.2.245` — usuario `admin`, contraseña definida en la preparación del entorno |
-| BIG-IP VE CLI (SSH) | `ssh admin@192.0.2.245` desde el cliente de administración `192.0.2.10` |
-| Cliente de pruebas | `10.10.10.10/24` — acceso SSH y capacidad para ejecutar `curl` y navegador web |
-| Servidor web01 | `10.20.20.11/24` — SSH disponible, Apache HTTP Server 2.4.58 activo en TCP/80 |
-| Servidor web02 | `10.20.20.12/24` — SSH disponible, Apache HTTP Server 2.4.58 activo en TCP/80 |
+**Seguridad:** conserva abierta una sesión administrativa a `10.1.1.200`; **no modifiques** interfaces de Azure, direcciones `.200`, VLANs, Self IPs, rutas de gestión, licenciamiento ni boot locations. No ejecutes comandos de eliminación sobre objetos preexistentes. **Contexto de comandos:** las instrucciones marcadas *Ubuntu (Bash)* se ejecutan en Ubuntu; las marcadas *BIG-IP (TMSH)* se ejecutan en el prompt `(tmos)#`; `tcpdump` se ejecuta en *BIG-IP (Bash)*, al cual puedes acceder desde TMSH con `run util bash`.
 
-## Entorno de Laboratorio
+## Entorno de laboratorio
 
-### Topología de red
+### Diagrama lógico 
 
-```
-                    Red Management: 192.0.2.0/24
-                    ┌──────────────────────────────┐
-                    │  Cliente Admin: 192.0.2.10    │
-                    │  BIG-IP Mgmt:   192.0.2.245   │
-                    └──────────────────────────────┘
+```mermaid
+flowchart LR
+    PC["PC Windows del estudiante<br/>TMUI / PuTTY / Escritorio remoto"]
+    PUB["IP pública de Azure<br/>(diferente por pod)"]
+    UB["Ubuntu gráfico<br/>eth0: 10.1.1.246<br/>eth1: 10.1.3.4"]
+    BIG["F5 BIG-IP VE<br/>Management: 10.1.1.200<br/>External Self IP: 10.1.3.200<br/>Internal Self IP: 10.1.2.200"]
+    VS["Virtual Server HTTP<br/>10.1.3.200:8080"]
+    POOL["pool_web_lab<br/>Round Robin + monitor HTTP"]
+    W1["Web01<br/>10.1.2.4:80"]
+    W2["Web02<br/>10.1.2.5:80"]
 
-  Red External: 10.10.10.0/24              Red Internal: 10.20.20.0/24
-  ┌─────────────────────────┐              ┌─────────────────────────┐
-  │ Cliente: 10.10.10.10    │              │ web01: 10.20.20.11      │
-  │ VIP:     10.10.10.100   │              │ web02: 10.20.20.12      │
-  │ BIG-IP:  10.10.10.245   │              │ BIG-IP: 10.20.20.245    │
-  └────────┬────────────────┘              └────────┬────────────────┘
-           │  Interfaz 1.1                          │  Interfaz 1.2
-           └────────────── BIG-IP VE ───────────────┘
+    PC -->|"HTTPS / SSH públicos (DNAT)"| PUB
+    PUB -->|"Gestión"| BIG
+    PC -->|"Escritorio remoto"| UB
+    UB -.->|"eth0 - Management 10.1.1.0/24"| BIG
+    UB -->|"eth1 - External 10.1.3.0/24"| VS
+    VS --> BIG
+    BIG --> POOL
+    POOL -->|"Internal 10.1.2.0/24"| W1
+    POOL -->|"Internal 10.1.2.0/24"| W2
+
+    classDef device fill:#e8f0fe,stroke:#2563eb,color:#102a43
+    classDef service fill:#dcfce7,stroke:#16a34a,color:#143821
+    class PC,PUB,UB,BIG device
+    class VS,POOL,W1,W2 service
 ```
 
-### Software del laboratorio
+**Flujo que se analizará:** `Ubuntu 10.1.3.4:puerto_efímero → 10.1.3.200:8080 → BIG-IP → 10.1.2.4:80 o 10.1.2.5:80`.
 
-| Componente | Versión exacta | Fuente oficial |
-|---|---|---|
-| F5 BIG-IP VE | 17.1.2 | [https://my.f5.com/manage/s/downloads](https://my.f5.com/manage/s/downloads) |
-| Ubuntu Server (web01, web02) | 22.04.4 LTS (amd64) | [https://releases.ubuntu.com/22.04/](https://releases.ubuntu.com/22.04/) |
-| Apache HTTP Server | 2.4.58 | Incluido en repositorios de Ubuntu 22.04.4 LTS |
-| curl (cliente de pruebas) | 8.5.0 | Incluido en repositorios de Ubuntu 22.04.4 LTS |
-| tcpdump (BIG-IP) | Incluido en BIG-IP 17.1.2 | Preinstalado en TMOS |
+> **Particularidad de Azure:** en este pod la IP `10.1.3.200` sí está asignada a BIG-IP. Se reutiliza como destino del Virtual Server **solo en TCP/8080**, evitando el TCP/443 administrativo estudiado en el Laboratorio 1. Una VIP adicional como `10.1.3.100` exigiría verificar previamente su asignación y encaminamiento en la infraestructura de Azure. No se presume que cualquier dirección libre de la subred funcione como VIP. Para producción es preferible reservar una IP dedicada para la aplicación.
 
-### Verificación previa del entorno
+### Tabla de direccionamiento
 
-Antes de iniciar, confirma que los servidores backend están operativos. Desde el cliente de administración (`192.0.2.10`), ejecuta:
+| Equipo / objeto | Interfaz o plano | IP / puerto | Uso |
+|---|---|---|---|
+| PC Windows | Internet | IP pública del pod (variable) | Administración y RDP |
+| BIG-IP | Management | `10.1.1.200/24` | TMUI y SSH privados |
+| Ubuntu | `eth0` | `10.1.1.246/24` | Administración privada |
+| Ubuntu | `eth1` | `10.1.3.4/24` | Cliente HTTP |
+| BIG-IP | VLAN `External`, interfaz `1.1` | `10.1.3.200/24` | Self IP externa |
+| BIG-IP | VLAN `Internal`, interfaz `1.2` | `10.1.2.200/24` | Self IP interna; origen SNAT AutoMap previsto |
+| Web01 | Red Internal | `10.1.2.4:80` | Backend 1 |
+| Web02 | Red Internal | `10.1.2.5:80` | Backend 2 |
+| `vs_web_lab` | VLAN External | `10.1.3.200:8080` | Entrada al servicio balanceado |
 
-```bash
-## Verificar que web01 responde en HTTP
-ssh usuario@10.20.20.11 "curl -s -o /dev/null -w '%{http_code}' http://localhost/"
-## Resultado esperado: 200
+**No se crea una ruta por defecto en esta práctica.** Ubuntu y ambas Self IPs se encuentran en redes conectadas directamente a BIG-IP. El funcionamiento de una solicitud al Virtual Server no depende de inventar un gateway `10.1.3.1`. Si los servidores backend no responden al monitor, debe comprobarse también su ruta de retorno o las políticas de red; no se asumirán gateways no verificados.
 
-## Verificar que web02 responde en HTTP
-ssh usuario@10.20.20.12 "curl -s -o /dev/null -w '%{http_code}' http://localhost/"
-## Resultado esperado: 200
+### Distribución del tiempo
 
-## Verificar que el gateway por defecto de ambos servidores apunta a BIG-IP internal
-ssh usuario@10.20.20.11 "ip route show default"
-## Resultado esperado: default via 10.20.20.245 dev <interfaz>
+| Paso | Actividad | Tiempo |
+|---|---|---:|
+| 1 | Baseline de interfaces, Self IPs y rutas | 8 min |
+| 2 | Monitor de salud y pool | 10 min |
+| 3 | Virtual Server Standard y SNAT AutoMap | 12 min |
+| 4 | Pruebas de conectividad y reparto | 8 min |
+| 5 | Conexiones TCP sin HTTP, HTTP válido y análisis con `tcpdump` | 12 min |
+| 6 | Retiro controlado de un backend y recuperación | 12 min |
+| 7 | Validación integral y registro de evidencia | 8 min |
+| **Total** | | **70 min** |
 
-ssh usuario@10.20.20.12 "ip route show default"
-## Resultado esperado: default via 10.20.20.245 dev <interfaz>
-```
+## Verificación previa del entorno
 
-Confirma también que cada servidor web muestra contenido diferenciado para facilitar la identificación durante las pruebas de balanceo:
-
-```bash
-## En web01 (10.20.20.11):
-echo "<h1>Servidor: web01 — 10.20.20.11</h1>" | sudo tee /var/www/html/index.html
-
-## En web02 (10.20.20.12):
-echo "<h1>Servidor: web02 — 10.20.20.12</h1>" | sudo tee /var/www/html/index.html
-```
-
-## Instrucciones Paso a Paso
-
-### Paso 1: Exploración del estado inicial de interfaces
-
-**Objetivo:** Examinar las interfaces disponibles en BIG-IP VE (Management, 1.1, 1.2), verificar su estado operativo y documentar la configuración de red existente de fábrica.
-
-**Instrucciones:**
-
-1. Accede a la GUI de BIG-IP desde el navegador del cliente de administración:
-
-   ```
-   https://192.0.2.245
-   ```
-
-   Inicia sesión con el usuario `admin` y la contraseña configurada durante el despliegue.
-
-2. En TMUI, navega a **Network > Interfaces**. Observa las interfaces listadas. Deberías ver al menos `mgmt`, `1.1` y `1.2`. Registra el estado (`Status`) de cada una: debe mostrar **up** con indicador verde si el enlace está activo.
-
-3. Navega a **Network > VLANs**. Confirma que no existen VLANs configuradas (estado de fábrica).
-
-4. Navega a **Network > Self IPs**. Confirma que no existen Self IPs de plano de datos (solo la Management IP existente en la interfaz `mgmt`).
-
-5. Navega a **Network > Routes**. Confirma que no existen rutas estáticas configuradas para el plano de datos.
-
-6. Abre una sesión SSH al BIG-IP y accede a tmsh:
+1. Desde Ubuntu, verifica que la interfaz External tenga `10.1.3.4`:
 
    ```bash
-   ssh admin@192.0.2.245
+   ip -4 addr show eth1
+   ip route get 10.1.3.200
+   ping -c 3 10.1.3.200
    ```
 
+   **Interpretación:** la salida de `ip route get` debe indicar la interfaz `eth1`; no se configura una ruta estática nueva.
+
+2. Desde Ubuntu, abre `https://10.1.1.200` en Firefox y confirma que puedes iniciar sesión en TMUI. En una terminal independiente, comprueba la conectividad al puerto de administración:
+
    ```bash
-   tmsh
+   curl -k -s -o /dev/null -w 'HTTP %{http_code}\n' https://10.1.1.200/tmui/login.jsp
    ```
 
-7. Ejecuta los siguientes comandos para verificar el estado de las interfaces desde la CLI:
+   Se espera una respuesta HTTP, normalmente `200`; un código distinto no implica necesariamente falta de conectividad.
 
-   ```bash
-   show net interface
-   ```
+3. Desde TMSH en BIG-IP:
 
-8. Verifica que no existen VLANs, Self IPs ni rutas de plano de datos:
-
-   ```bash
+   ```text
+   show sys version
+   list net self
    list net vlan
-   list net self
-   list net route
+   list ltm virtual one-line
    ```
 
-9. Consulta la configuración de la interfaz de gestión:
+   **Punto de control:** comprueba que ningún Virtual Server existente usa `10.1.3.200:8080` ni un destino comodín que coincida con ese puerto. Si aparece `vs_web_lab` de una ejecución anterior, comprueba sus propiedades antes de continuar y reutilízalo solo si coincide con los parámetros de este documento. Si hay otro listener en conflicto, **no lo elimines ni sobrescribas**: detén la creación y reporta el conflicto, indicando el nombre y destino encontrados.
 
-   ```bash
-   list sys management-ip
-   ```
+## Instrucciones paso a paso
 
-**Resultado esperado:**
+### Paso 1. Analizar interfaces, VLANs, Self IPs y routing existentes (8 min)
 
-La salida de `show net interface` debe mostrar tres interfaces con estado `up`:
+**Objetivo:** obtener un estado inicial verificable antes de crear objetos LTM.
 
-```
---------------------------------------------------
-Net::Interface
-Name  Status  Bits  Bits  Pkts  Pkts  Drops  Errs
-                In   Out    In   Out
---------------------------------------------------
-1.1      up      0     0     0     0      0     0
-1.2      up      0     0     0     0      0     0
-mgmt     up   ...   ...   ...   ...    ...   ...
-```
+1. En **Network → Interfaces**, comprueba los puertos de datos `1.1` y `1.2`.
+2. En **Network → VLANs**, identifica `External` y `Internal`. **No las recrees**.
+3. En **Network → Self IPs**, verifica `External-IP = 10.1.3.200/24` y la Self IP interna `10.1.2.200/24`. **No cambies Port Lockdown**.
+4. En **Network → Routes**, observa qué rutas aparecen. Las subredes conectadas pueden aparecer en la tabla operativa sin ser rutas estáticas creadas por el usuario.
+5. Verifica en TMSH:
 
-Los comandos `list net vlan`, `list net self` y `list net route` no deben devolver objetos (o solo la configuración mínima de fábrica).
-
-El comando `list sys management-ip` debe mostrar:
-
-```
-sys management-ip 192.0.2.245/24 { }
-```
-
-**Verificación:**
-
-- [ ] Las tres interfaces (mgmt, 1.1, 1.2) muestran estado `up` tanto en TMUI como en tmsh.
-- [ ] No existen VLANs, Self IPs de plano de datos ni rutas estáticas previas.
-- [ ] La Management IP es `192.0.2.245/24`.
-
----
-
-### Paso 2: Configuración de VLANs
-
-**Objetivo:** Crear dos VLANs — `external` (asignada a la interfaz 1.1 como untagged) e `internal` (asignada a la interfaz 1.2 como untagged) — para segmentar el tráfico de clientes y servidores.
-
-**Instrucciones:**
-
-1. **Crear la VLAN `external` mediante TMUI:**
-
-   - Navega a **Network > VLANs > VLAN List** y haz clic en **Create**.
-   - Configura los siguientes campos:
-     - **Name:** `external`
-     - **Tag:** `10`
-     - En la sección **Interfaces**, haz clic en **Add**:
-       - **Interface:** `1.1`
-       - **Tagging:** `Untagged`
-     - Haz clic en **Finished**.
-
-2. **Crear la VLAN `internal` mediante TMUI:**
-
-   - Repite el proceso con los siguientes valores:
-     - **Name:** `internal`
-     - **Tag:** `20`
-     - **Interface:** `1.2`
-     - **Tagging:** `Untagged`
-     - Haz clic en **Finished**.
-
-3. **Verificar las VLANs creadas mediante tmsh:**
-
-   ```bash
-   list net vlan external
-   ```
-
-   ```bash
-   list net vlan internal
-   ```
-
-4. **Verificar el estado operativo de las VLANs:**
-
-   ```bash
-   show net vlan
-   ```
-
-> **Nota técnica:** Al configurar una interfaz como **untagged** en una VLAN, todo el tráfico que ingresa por esa interfaz sin etiqueta 802.1Q se asocia a dicha VLAN. El tag numérico (10, 20) se utiliza internamente por TMOS para identificar la VLAN, pero no se inserta en las tramas de la interfaz untagged. Si la infraestructura de virtualización ya etiqueta las tramas con tags 802.1Q específicos, sería necesario configurar las interfaces como **tagged** y hacer coincidir los tags.
-
-**Resultado esperado:**
-
-```
-net vlan external {
-    if-index 144
-    interfaces {
-        1.1 {
-            untagged
-        }
-    }
-    tag 10
-}
-```
-
-```
-net vlan internal {
-    if-index 160
-    interfaces {
-        1.2 {
-            untagged
-        }
-    }
-    tag 20
-}
-```
-
-**Verificación:**
-
-- [ ] La VLAN `external` aparece asociada a la interfaz `1.1` como untagged con tag `10`.
-- [ ] La VLAN `internal` aparece asociada a la interfaz `1.2` como untagged con tag `20`.
-- [ ] Ambas VLANs muestran estado operativo activo en `show net vlan`.
-
----
-
-### Paso 3: Configuración de Self IPs
-
-**Objetivo:** Crear Self IPs no flotantes en cada VLAN con port lockdown `Allow Default` para habilitar la comunicación del plano de datos y los servicios básicos de gestión en banda.
-
-**Instrucciones:**
-
-1. **Crear la Self IP para la VLAN `external` mediante tmsh:**
-
-   ```bash
-   create net self self_external address 10.10.10.245/24 vlan external allow-service default
-   ```
-
-2. **Crear la Self IP para la VLAN `internal` mediante tmsh:**
-
-   ```bash
-   create net self self_internal address 10.20.20.245/24 vlan internal allow-service default
-   ```
-
-3. **Guardar la configuración:**
-
-   ```bash
-   save sys config
-   ```
-
-4. **Verificar las Self IPs creadas:**
-
-   ```bash
-   list net self
-   ```
-
-5. **Verificar mediante TMUI:** Navega a **Network > Self IPs**. Confirma que ambas Self IPs aparecen con los valores correctos.
-
-6. **Probar la conectividad desde el cliente de pruebas** (`10.10.10.10`):
-
-   ```bash
-   ping -c 4 10.10.10.245
-   ```
-
-7. **Probar la conectividad desde web01** (`10.20.20.11`):
-
-   ```bash
-   ping -c 4 10.20.20.245
-   ```
-
-> **Reflexión de seguridad:** La opción `allow-service default` permite protocolos como ICMP, SSH (TCP/22) y ciertos servicios de TMOS en la Self IP. En un entorno de producción, se recomienda evaluar `allow-service none` o `allow-service` con una lista explícita de puertos para minimizar la superficie de ataque. En este laboratorio se utiliza `default` para facilitar la verificación y el diagnóstico.
-
-**Resultado esperado:**
-
-```
-net self self_external {
-    address 10.10.10.245/24
-    allow-service {
-        default
-    }
-    traffic-group traffic-group-local-only
-    vlan external
-}
-net self self_internal {
-    address 10.20.20.245/24
-    allow-service {
-        default
-    }
-    traffic-group traffic-group-local-only
-    vlan internal
-}
-```
-
-El ping desde el cliente (`10.10.10.10`) hacia `10.10.10.245` debe ser exitoso:
-
-```
-PING 10.10.10.245 (10.10.10.245) 56(84) bytes of data.
-64 bytes from 10.10.10.245: icmp_seq=1 ttl=255 time=0.8 ms
-...
-4 packets transmitted, 4 received, 0% packet loss
-```
-
-El ping desde web01 (`10.20.20.11`) hacia `10.20.20.245` debe ser igualmente exitoso.
-
-**Verificación:**
-
-- [ ] `list net self` muestra ambas Self IPs con las direcciones, VLANs y port lockdown correctos.
-- [ ] El cliente de pruebas puede hacer ping a `10.10.10.245`.
-- [ ] El servidor web01 puede hacer ping a `10.20.20.245`.
-- [ ] Ambas Self IPs aparecen en TMUI con estado operativo correcto.
-
----
-
-### Paso 4: Configuración de routing estático
-
-**Objetivo:** Definir una ruta estática por defecto en BIG-IP que garantice que el tráfico de retorno desde el segmento de servidores pueda alcanzar redes externas, y verificar la alcanzabilidad extremo a extremo.
-
-**Instrucciones:**
-
-1. **Analizar la tabla de rutas actual:**
-
-   ```bash
-   show net route
-   ```
-
-   Observa que BIG-IP ya conoce las redes directamente conectadas (`10.10.10.0/24` y `10.20.20.0/24`) pero no tiene ruta por defecto para alcanzar redes externas.
-
-2. **Crear la ruta por defecto mediante tmsh.** En esta topología de laboratorio, el gateway por defecto del BIG-IP en la red external es `10.10.10.1` (si existe un router/gateway en la VLAN external). Sin embargo, dado que el cliente de pruebas está en la misma subred (`10.10.10.0/24`), la ruta por defecto no es estrictamente necesaria para la comunicación directa cliente–BIG-IP. No obstante, se configura como práctica estándar:
-
-   ```bash
-   create net route default_route network 0.0.0.0/0 gw 10.10.10.1
-   ```
-
-   > **Nota:** Si en tu entorno de laboratorio no existe un gateway en `10.10.10.1`, puedes omitir este paso o configurar una ruta alternativa. La comunicación entre el cliente (`10.10.10.10`) y el Virtual Server (`10.10.10.100`) funcionará sin ruta por defecto porque ambos están en la misma subred. La ruta por defecto es necesaria cuando los clientes provienen de redes remotas.
-
-3. **Verificar la tabla de rutas:**
-
-   ```bash
-   list net route
-   ```
-
-4. **Verificar mediante TMUI:** Navega a **Network > Routes**. Confirma que la ruta aparece listada.
-
-5. **Verificar la conectividad bidireccional completa.** Desde BIG-IP, prueba la alcanzabilidad hacia los servidores backend:
-
-   ```bash
-   run util ping -c 4 10.20.20.11
-   run util ping -c 4 10.20.20.12
-   ```
-
-6. **Verificar la alcanzabilidad desde BIG-IP hacia el cliente:**
-
-   ```bash
-   run util ping -c 4 10.10.10.10
-   ```
-
-**Resultado esperado:**
-
-```
-net route default_route {
-    gw 10.10.10.1
-    network default
-}
-```
-
-Los pings desde BIG-IP hacia los servidores y el cliente deben ser exitosos con 0% de pérdida.
-
-**Verificación:**
-
-- [ ] `list net route` muestra la ruta por defecto configurada.
-- [ ] BIG-IP puede hacer ping a `10.20.20.11` y `10.20.20.12`.
-- [ ] BIG-IP puede hacer ping a `10.10.10.10`.
-- [ ] La tabla de rutas muestra las redes conectadas y la ruta por defecto.
-
----
-
-### Paso 5: Construcción del Virtual Server con pool y health monitor
-
-**Objetivo:** Crear un health monitor HTTP, un pool con dos miembros (web01 y web02) y un Virtual Server de tipo Standard en `10.10.10.100:80`, habilitando SNAT AutoMap, y verificar que todos los objetos alcancen estado Available (verde).
-
-**Instrucciones:**
-
-1. **Crear un health monitor HTTP personalizado mediante tmsh:**
-
-   ```bash
-   create ltm monitor http monitor_http_lab send "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" recv "200 OK" interval 10 timeout 31
-   ```
-
-   > **Explicación:** Este monitor envía una solicitud HTTP GET a la raíz (`/`) de cada pool member cada 10 segundos. Si no recibe una respuesta que contenga `200 OK` en 31 segundos (3 intentos fallidos + 1 segundo de margen), marca el miembro como no disponible.
-
-2. **Crear el pool con los dos servidores backend:**
-
-   ```bash
-   create ltm pool pool_web_lab members add { 10.20.20.11:80 { address 10.20.20.11 } 10.20.20.12:80 { address 10.20.20.12 } } monitor monitor_http_lab load-balancing-mode round-robin
-   ```
-
-3. **Verificar el estado del pool y sus miembros:**
-
-   ```bash
-   show ltm pool pool_web_lab
-   show ltm pool pool_web_lab members
-   ```
-
-4. **Crear el Virtual Server de tipo Standard:**
-
-   ```bash
-   create ltm virtual vs_web_lab destination 10.10.10.100:80 ip-protocol tcp pool pool_web_lab profiles add { tcp { } http { } } source-address-translation { type automap }
-   ```
-
-   > **Nota sobre SNAT AutoMap:** Al configurar `source-address-translation { type automap }`, BIG-IP reemplaza la dirección IP de origen del cliente con la Self IP de la VLAN por la cual envía el tráfico al servidor (en este caso, `10.20.20.245`). Esto garantiza que las respuestas del servidor regresen a BIG-IP y no intenten llegar directamente al cliente. Esta traducción es la evidencia clave del comportamiento full-proxy que se analizará en el Paso 6.
-
-5. **Guardar la configuración:**
-
-   ```bash
-   save sys config
-   ```
-
-6. **Verificar el estado del Virtual Server:**
-
-   ```bash
-   show ltm virtual vs_web_lab
-   ```
-
-7. **Verificar todos los objetos en TMUI:**
-
-   - Navega a **Local Traffic > Virtual Servers > Virtual Server List**. Confirma que `vs_web_lab` muestra un círculo verde (Available).
-   - Navega a **Local Traffic > Pools > Pool List**. Confirma que `pool_web_lab` muestra un círculo verde.
-   - Haz clic en `pool_web_lab` y luego en la pestaña **Members**. Confirma que ambos miembros (`10.20.20.11:80` y `10.20.20.12:80`) muestran círculos verdes.
-
-8. **Probar el acceso desde el cliente de pruebas** (`10.10.10.10`):
-
-   ```bash
-   curl -s http://10.10.10.100/
-   ```
-
-9. **Ejecutar múltiples solicitudes para observar el balanceo Round Robin:**
-
-   ```bash
-   for i in $(seq 1 6); do echo "--- Solicitud $i ---"; curl -s http://10.10.10.100/; echo; done
-   ```
-
-**Resultado esperado:**
-
-El estado del Virtual Server debe mostrar `available` y estadísticas de tráfico:
-
-```
-Ltm::Virtual Server: vs_web_lab
-  Availability     : available
-  State            : enabled
-  Reason           : The virtual server is available
-  ...
-```
-
-El estado del pool debe mostrar ambos miembros como `available`:
-
-```
-Ltm::Pool: pool_web_lab
-  Availability : available
-  State        : enabled
-  ...
-  Ltm::Pool Member: 10.20.20.11:80
-    Availability : available
-    State        : enabled
-  Ltm::Pool Member: 10.20.20.12:80
-    Availability : available
-    State        : enabled
-```
-
-Las solicitudes `curl` deben alternar entre los dos servidores:
-
-```
---- Solicitud 1 ---
-<h1>Servidor: web01 — 10.20.20.11</h1>
---- Solicitud 2 ---
-<h1>Servidor: web02 — 10.20.20.12</h1>
---- Solicitud 3 ---
-<h1>Servidor: web01 — 10.20.20.11</h1>
---- Solicitud 4 ---
-<h1>Servidor: web02 — 10.20.20.12</h1>
---- Solicitud 5 ---
-<h1>Servidor: web01 — 10.20.20.11</h1>
---- Solicitud 6 ---
-<h1>Servidor: web02 — 10.20.20.12</h1>
-```
-
-**Verificación:**
-
-- [ ] El monitor `monitor_http_lab` existe y está configurado con `send`, `recv`, `interval` y `timeout` correctos.
-- [ ] El pool `pool_web_lab` contiene dos miembros y ambos están en estado Available (verde).
-- [ ] El Virtual Server `vs_web_lab` está en estado Available (verde) y escucha en `10.10.10.100:80`.
-- [ ] Las solicitudes `curl` desde el cliente devuelven contenido HTTP alternando entre web01 y web02.
-- [ ] SNAT AutoMap está habilitado en el Virtual Server.
-
----
-
-### Paso 6: Análisis del flujo de tráfico con tcpdump
-
-**Objetivo:** Ejecutar capturas de tráfico simultáneas en las interfaces external e internal de BIG-IP mientras se genera tráfico HTTP desde el cliente, para observar la traducción de direcciones IP que evidencia el comportamiento full-proxy y SNAT AutoMap.
-
-**Instrucciones:**
-
-1. **Abrir dos sesiones SSH simultáneas al BIG-IP** (`192.0.2.245`). Denomínalas **Terminal A** (captura en external) y **Terminal B** (captura en internal).
-
-2. **En Terminal A**, inicia la captura en la VLAN external filtrando el tráfico del Virtual Server:
-
-   ```bash
-   tcpdump -nni external -c 50 host 10.10.10.100 and port 80
-   ```
-
-3. **En Terminal B**, inicia la captura en la VLAN internal filtrando el tráfico HTTP hacia los servidores:
-
-   ```bash
-   tcpdump -nni internal -c 50 port 80
-   ```
-
-4. **Desde el cliente de pruebas** (`10.10.10.10`), genera una solicitud HTTP:
-
-   ```bash
-   curl -s http://10.10.10.100/
-   ```
-
-5. **Analiza la captura en Terminal A** (VLAN external). Deberías observar paquetes entre el **cliente** y el **Virtual Server**:
-
-   ```
-   10.10.10.10.xxxxx > 10.10.10.100.80: Flags [S], ...
-   10.10.10.100.80 > 10.10.10.10.xxxxx: Flags [S.], ...
-   10.10.10.10.xxxxx > 10.10.10.100.80: Flags [.], ...
-   10.10.10.10.xxxxx > 10.10.10.100.80: Flags [P.], ... HTTP GET /
-   10.10.10.100.80 > 10.10.10.10.xxxxx: Flags [P.], ... HTTP 200 OK
-   ...
-   ```
-
-   **Observación clave:** En la VLAN external, la dirección de destino es `10.10.10.100` (la VIP) y la dirección de origen es `10.10.10.10` (el cliente). BIG-IP responde como `10.10.10.100`.
-
-6. **Analiza la captura en Terminal B** (VLAN internal). Deberías observar paquetes entre **BIG-IP** y el **servidor seleccionado**:
-
-   ```
-   10.20.20.245.xxxxx > 10.20.20.11.80: Flags [S], ...
-   10.20.20.11.80 > 10.20.20.245.xxxxx: Flags [S.], ...
-   10.20.20.245.xxxxx > 10.20.20.11.80: Flags [.], ...
-   10.20.20.245.xxxxx > 10.20.20.11.80: Flags [P.], ... HTTP GET /
-   10.20.20.11.80 > 10.20.20.245.xxxxx: Flags [P.], ... HTTP 200 OK
-   ...
-   ```
-
-   **Observación clave:** En la VLAN internal:
-   - La **dirección de origen** es `10.20.20.245` (la Self IP internal de BIG-IP), **no** `10.10.10.10` (el cliente). Esto es el efecto de SNAT AutoMap.
-   - La **dirección de destino** es `10.20.20.11` o `10.20.20.12` (el pool member seleccionado), **no** `10.10.10.100` (la VIP).
-
-7. **Documenta la correlación full-proxy** completando la siguiente tabla con los datos observados:
-
-   | Atributo | Conexión cliente (external) | Conexión servidor (internal) |
-   |---|---|---|
-   | IP de origen | `10.10.10.10` (cliente) | `10.20.20.245` (Self IP BIG-IP) |
-   | IP de destino | `10.10.10.100` (VIP) | `10.20.20.11` o `.12` (pool member) |
-   | Puerto de origen | Efímero del cliente | Efímero de BIG-IP |
-   | Puerto de destino | `80` | `80` |
-
-8. **Genera múltiples solicitudes y observa la distribución:**
-
-   ```bash
-   for i in $(seq 1 4); do curl -s http://10.10.10.100/ > /dev/null; done
-   ```
-
-   En Terminal B, observa cómo las conexiones se distribuyen entre `10.20.20.11` y `10.20.20.12`.
-
-9. **Detén las capturas** con `Ctrl+C` si aún están activas.
-
-10. **(Opcional) Captura a archivo para análisis posterior:**
-
-    ```bash
-    tcpdump -nni external -c 100 -w /var/tmp/capture_external.pcap host 10.10.10.100 and port 80
-    tcpdump -nni internal -c 100 -w /var/tmp/capture_internal.pcap port 80
-    ```
-
-    Estos archivos pueden descargarse y abrirse con Wireshark para un análisis más detallado.
-
-**Resultado esperado:**
-
-La comparación de las capturas debe evidenciar claramente **dos conexiones TCP independientes**:
-
-- **Conexión 1 (external):** Cliente (`10.10.10.10`) ↔ VIP (`10.10.10.100`)
-- **Conexión 2 (internal):** BIG-IP Self IP (`10.20.20.245`) ↔ Pool Member (`10.20.20.11` o `10.20.20.12`)
-
-Esta separación demuestra que BIG-IP **no reenvía paquetes** del cliente al servidor. En su lugar, **termina** la conexión del cliente y **crea** una nueva conexión hacia el servidor. Este es el comportamiento definitorio de la arquitectura **full-proxy**.
-
-**Verificación:**
-
-- [ ] En la captura de la VLAN external, la IP de origen es la del cliente (`10.10.10.10`) y la de destino es la VIP (`10.10.10.100`).
-- [ ] En la captura de la VLAN internal, la IP de origen es la Self IP de BIG-IP (`10.20.20.245`) — evidencia de SNAT AutoMap.
-- [ ] En la captura de la VLAN internal, la IP de destino es la de un pool member (`10.20.20.11` o `10.20.20.12`), no la VIP.
-- [ ] Se observan handshakes TCP (SYN, SYN-ACK, ACK) independientes en cada VLAN, confirmando dos conexiones separadas.
-- [ ] Las múltiples solicitudes se distribuyen entre ambos pool members (Round Robin).
-
----
-
-### Paso 7: Verificación integral del estado de todos los objetos
-
-**Objetivo:** Realizar una verificación completa de todos los componentes del camino de datos y reflexionar sobre cómo la pérdida de cualquier componente afectaría la disponibilidad del servicio.
-
-**Instrucciones:**
-
-1. **Verificar el estado de todas las interfaces:**
-
-   ```bash
+   ```text
    show net interface
-   ```
-
-2. **Verificar el estado de todas las VLANs:**
-
-   ```bash
-   show net vlan
-   ```
-
-3. **Verificar el estado de todas las Self IPs:**
-
-   ```bash
+   list net vlan External
+   list net vlan Internal
    list net self
-   ```
-
-4. **Verificar la tabla de rutas completa:**
-
-   ```bash
    show net route
    ```
 
-5. **Verificar el estado de los nodos (nodes):**
+**Preguntas de análisis:** ¿Por qué el cliente `10.1.3.4` alcanza directamente la Self IP externa? ¿Por qué un monitor hacia `10.1.2.4` no requiere una ruta por defecto en BIG-IP? ¿Qué diferencia existe entre Management IP y Self IP?
 
-   ```bash
-   show ltm node
-   ```
+**Evidencia:** registra que la Self IP externa pertenece a `External`, que la Self IP interna pertenece a `Internal` y que no modificaste ninguna de ellas. Si un objeto de red tiene otro nombre, usa el que realmente aparece en tu BIG-IP, sin crear duplicados.
 
-6. **Verificar el estado del pool y sus miembros:**
+### Paso 2. Crear un monitor HTTP y un pool de dos servidores (10 min)
 
-   ```bash
-   show ltm pool pool_web_lab
+**Objetivo:** hacer que BIG-IP decida qué servidores pueden recibir tráfico a partir de una comprobación HTTP.
+
+1. En TMUI, entra a **Local Traffic → Monitors → Create**. Si `monitor_http_lab` ya existe, ábrelo y verifica sus parámetros; de lo contrario, créalo con:
+
+   | Campo | Valor |
+   |---|---|
+   | Name | `monitor_http_lab` |
+   | Type | `HTTP` |
+   | Parent Monitor | `http` |
+   | Interval | `5` segundos |
+   | Timeout | `16` segundos |
+   | Send String | `GET / HTTP/1.0\r\n\r\n` |
+   | Receive String | `200 OK` |
+
+   Si el formulario presenta **Send String** como campo de texto, escribe exactamente `GET / HTTP/1.0\r\n\r\n` (con las secuencias de retorno de carro y nueva línea). No escribas literalmente los caracteres de control como saltos de línea manuales.
+
+   La petición y la cadena de recepción sirven para distinguir **servicio HTTP disponible** de simple respuesta a ping.
+
+2. En **Local Traffic → Pools → Pool List → Create**, crea `pool_web_lab` si no existe. Si ya existe, comprueba sus miembros y su monitor en lugar de duplicarlo. Utiliza:
+
+   | Campo | Valor |
+   |---|---|
+   | Name | `pool_web_lab` |
+   | Health Monitors | `monitor_http_lab` |
+   | Load Balancing Method | `Round Robin` |
+   | Member 1 | `10.1.2.4`, Service Port `80` |
+   | Member 2 | `10.1.2.5`, Service Port `80` |
+
+3. Abre `pool_web_lab → Members` y espera hasta unos 20–30 segundos para que el monitor complete sus primeras comprobaciones. Deben existir dos miembros con estado **Available** (verde). Si no están disponibles, consulta el apartado de solución de problemas antes de crear el Virtual Server.
+4. Verifica en TMSH:
+
+   ```text
+   list ltm monitor http monitor_http_lab
+   list ltm pool pool_web_lab
    show ltm pool pool_web_lab members
    ```
 
-7. **Verificar el estado del Virtual Server:**
+**Si un miembro no está disponible:** antes de modificar el monitor, comprueba que Apache responda HTTP en el servidor, que BIG-IP tenga conectividad hacia la red Internal y que no exista bloqueo en el host o Azure. `Available` indica que **el monitor obtiene una respuesta válida**, no que el servidor sea inmune a fallos.
 
-   ```bash
+### Paso 3. Publicar un Virtual Server Standard (12 min)
+
+**Objetivo:** ofrecer un único servicio HTTP que distribuya nuevas conexiones hacia el pool.
+
+1. En **Local Traffic → Virtual Servers → Virtual Server List**, crea `vs_web_lab` si no existe; si ya existe, abre sus propiedades y comprueba que coincidan con las siguientes. En **Create**, utiliza:
+
+   | Campo | Valor |
+   |---|---|
+   | Name | `vs_web_lab` |
+   | Type | `Standard` |
+   | Destination Address | `10.1.3.200` |
+   | Service Port | `8080` (especificar puerto personalizado) |
+   | Protocol | `TCP` |
+   | HTTP Profile | `http` |
+   | TCP Profile | `tcp` o perfil TCP predeterminado apropiado |
+   | Default Pool | `pool_web_lab` |
+   | Source Address Translation | `Auto Map` |
+
+   Si la pantalla de tu versión separa **Configuration**, **Resources** o los perfiles en distintas secciones, completa primero los parámetros del servicio y luego asigna el *Default Pool* y los perfiles en las secciones que corresponda. No guardes el Virtual Server sin `pool_web_lab` como pool predeterminado.
+
+   **Importante:** no cambies a TCP/443 ni crees una VIP `10.1.3.100`; el primero puede interferir con la administración y la segunda puede no estar asignada a la NIC de Azure.
+
+2. Guarda y confirma que el Virtual Server aparece **Available**. Revisa:
+
+   ```text
+   list ltm virtual vs_web_lab
    show ltm virtual vs_web_lab
    ```
 
-8. **Verificar las estadísticas del Virtual Server:**
+3. Comprueba que la configuración incluye una traducción de origen equivalente a:
 
-   ```bash
-   show ltm virtual vs_web_lab stat
+   ```text
+   source-address-translation {
+       type automap
+   }
    ```
 
-9. **En TMUI**, navega a **Local Traffic > Network Map**. Esta vista muestra gráficamente la relación entre Virtual Servers, pools y miembros con sus estados de disponibilidad codificados por colores.
+**Concepto técnico:** BIG-IP mantiene una conexión TCP con el cliente y una conexión TCP distinta hacia el backend. Al usar AutoMap, en el lado Internal normalmente sustituye la IP de origen del cliente (`10.1.3.4`) por la Self IP de salida (`10.1.2.200`).
 
-10. **Reflexión sobre puntos de fallo.** Completa mentalmente o por escrito la siguiente tabla de análisis de impacto:
+**Comprobación de conflicto:** el destino `10.1.3.200:8080` coincide con la dirección de una Self IP, pero no con sus servicios administrativos TCP/22 o TCP/443. El Virtual Server es el listener de aplicación para el puerto 8080. Esta elección es **específica de las restricciones del pod**, no una recomendación de diseño para producción.
 
-    | Componente que falla | Impacto en el servicio |
-    |---|---|
-    | Interfaz 1.1 (down) | El tráfico de la VLAN external no puede alcanzar BIG-IP; el Virtual Server se vuelve inalcanzable para los clientes. |
-    | Interfaz 1.2 (down) | BIG-IP no puede comunicarse con los servidores backend; el pool pierde todos sus miembros. |
-    | Self IP external eliminada | BIG-IP pierde presencia en la VLAN external; no puede responder al tráfico del Virtual Server. |
-    | Self IP internal eliminada | BIG-IP pierde presencia en la VLAN internal; los health monitors fallan y los miembros se marcan como offline. |
-    | Ruta por defecto eliminada | En esta topología, impacto limitado porque cliente y servidores están en subredes directamente conectadas. En producción, los clientes remotos no podrían recibir respuestas. |
-    | Un pool member falla | El monitor marca al miembro como no disponible; el tráfico se redirige al miembro restante. El servicio continúa con capacidad reducida. |
-    | Ambos pool members fallan | El pool se marca como offline (rojo); el Virtual Server deja de responder solicitudes (o responde con un error si hay un perfil de fallback configurado). |
+### Paso 4. Probar el servicio y observar la distribución (8 min)
 
-**Resultado esperado:**
+**Objetivo:** demostrar funcionalidad antes de interpretar los paquetes.
 
-Todos los objetos deben mostrar estado `available` y `enabled`:
-
-```
-Ltm::Virtual Server: vs_web_lab
-  Availability : available
-  State        : enabled
-
-Ltm::Pool: pool_web_lab
-  Availability : available
-  Active Members : 2
-
-Ltm::Node: 10.20.20.11
-  Availability : available
-Ltm::Node: 10.20.20.12
-  Availability : available
-```
-
-Las estadísticas del Virtual Server deben reflejar las solicitudes procesadas durante el laboratorio.
-
-**Verificación:**
-
-- [ ] Todas las interfaces muestran estado `up`.
-- [ ] Todas las VLANs están operativas.
-- [ ] Todas las Self IPs están configuradas correctamente.
-- [ ] Los nodos, pool members, pool y Virtual Server están en estado Available (verde).
-- [ ] Las estadísticas muestran contadores de conexiones y bytes procesados mayor que cero.
-- [ ] El Network Map en TMUI muestra la cadena completa VS → Pool → Members en verde.
-
-## Validación y Pruebas
-
-### Prueba 1: Conectividad extremo a extremo
-
-Desde el cliente de pruebas, ejecuta:
-
-```bash
-curl -v http://10.10.10.100/
-```
-
-**Criterio de éxito:** La respuesta incluye código HTTP `200`, las cabeceras del servidor y el contenido HTML de uno de los servidores backend. La salida verbose muestra la conexión TCP establecida contra `10.10.10.100:80`.
-
-### Prueba 2: Distribución de carga
-
-```bash
-for i in $(seq 1 10); do curl -s http://10.10.10.100/ 2>/dev/null; done | sort | uniq -c
-```
-
-**Criterio de éxito:** Ambos servidores reciben aproximadamente el mismo número de solicitudes (5 cada uno, con posible variación de ±1 debido al estado de las conexiones).
-
-### Prueba 3: Resiliencia ante fallo de un pool member
-
-1. Detén Apache en web02:
+1. Desde Ubuntu, ejecuta:
 
    ```bash
-   ssh usuario@10.20.20.12 "sudo systemctl stop apache2"
+   curl -v --connect-timeout 5 http://10.1.3.200:8080/
    ```
 
-2. Espera 35 segundos (timeout del monitor: 31 segundos + margen).
+   Debes recibir una respuesta HTTP válida, preferiblemente `200 OK`. Si no responde, no continúes con `tcpdump` sin revisar primero el pool y el VS.
 
-3. Verifica el estado del pool:
+2. Genera diez solicitudes independientes. `curl` establece una conexión nueva en cada iteración (no se reutiliza una sesión de `curl`):
 
    ```bash
+   for i in $(seq 1 10); do
+     printf 'Peticion %02d: ' "$i"
+     curl -sS --max-time 5 -o /dev/null -w '%{http_code}\n' http://10.1.3.200:8080/
+   done
+   ```
+
+3. Abre en TMUI **Local Traffic → Pools → Pool List → pool_web_lab → Members** y revisa las estadísticas de conexiones de cada miembro. Registra los contadores antes y después de las diez solicitudes para identificar el incremento; pueden existir conexiones adicionales procedentes de los monitores. Alternativamente, en TMSH:
+
+   ```text
+   show ltm pool pool_web_lab members
+   show ltm virtual vs_web_lab
+   ```
+
+**Interpretación:** con Round Robin y conexiones nuevas, ambas máquinas deben participar. **No es obligatorio obtener una alternancia exacta 1:1 en el HTML**: si ambos servidores devuelven la misma página, la distribución se demuestra con las estadísticas por miembro, no con el contenido de la respuesta. Tampoco se garantiza reparto idéntico si hay persistencia, conexiones reutilizadas o tráfico adicional.
+
+### Paso 5. Analizar full-proxy y SNAT mediante conexiones y captura (12 min)
+
+**Objetivo:** comprobar primero una conexión TCP del cliente sin petición HTTP y después observar en paquetes reales cómo BIG-IP selecciona un servidor y aplica SNAT AutoMap. Es importante distinguir lo que muestra la **tabla instantánea de conexiones** de lo que muestra una **captura de paquetes**.
+
+**Antes de comenzar:** debes haber recibido HTTP 200 desde `http://10.1.3.200:8080/` en el Paso 4. Si la aplicación no funciona, resuelve primero el problema de disponibilidad. Usa tres terminales abiertas en paralelo:
+
+| Terminal | Equipo y modo | Finalidad |
+|---|---|---|
+| A | BIG-IP, **Bash** | Captura con `tcpdump` |
+| B | BIG-IP, **TMSH** | Tabla de conexiones y estado del pool |
+| C | Ubuntu, **Bash** | Generación de tráfico HTTP |
+
+Si las sesiones SSH de BIG-IP abren directamente el prompt `(tmos)#`, mantén la Terminal B ahí. En la Terminal A escribe `run util bash` para entrar en Bash; **no antepongas `tmsh` a los comandos de la Terminal B**.
+
+**Parte A — Conexiones TCP sin solicitud HTTP**
+
+1. En la **Terminal C (Ubuntu)**, ejecuta el siguiente bloque completo. Abre diez sockets hacia la VIP y conserva cada socket abierto durante 45 segundos, sin enviar HTTP:
+
+   ```bash
+   for i in $(seq 1 10); do
+     (
+       exec 3<>/dev/tcp/10.1.3.200/8080 || exit
+       printf 'TCP %02d abierto\n' "$i"
+       sleep 45
+       exec 3<&-
+       exec 3>&-
+     ) &
+   done
+   wait
+   ```
+
+   **Mientras la terminal todavía está ocupada**, pasa a la Terminal B. No esperes a que termine `wait`.
+
+2. En la **Terminal B (BIG-IP, TMSH)**, ejecuta:
+
+   ```text
+   show sys connection cs-server-addr 10.1.3.200 cs-server-port 8080
+   ```
+
+   Deberías ver varias entradas similares a esta (el puerto efímero cambia):
+
+   ```text
+   10.1.3.4:49026  10.1.3.200:8080  any6.any  any6.any  tcp
+   ```
+
+   Las dos primeras columnas identifican al **cliente Ubuntu y la VIP**. `any6.any` indica que **no se muestran extremos de una conexión asociada hacia un backend** en ese momento. En esta prueba es esperable: solo se abrió TCP y no se envió una petición HTTP.
+
+   Si la tabla está vacía, ejecuta el comando anterior **mientras todavía transcurren los 45 segundos**. Confirma, en otra terminal de Ubuntu, que hay conexiones TCP abiertas:
+
+   ```bash
+   ss -tn | grep '10.1.3.200:8080'
+   ```
+
+   Espera a que finalice el primer `for` antes de continuar, para no confundir las conexiones de las dos pruebas.
+
+**Parte B — Solicitud HTTP válida y selección de un backend**
+
+3. En la **Terminal A (BIG-IP, Bash)**, inicia esta captura **antes de generar nuevas solicitudes**. La captura permanece activa hasta que pulses `Ctrl+C`:
+
+   ```bash
+   tcpdump -nni 0.0 -l '((host 10.1.3.4 and tcp port 8080) or ((host 10.1.2.4 or host 10.1.2.5) and tcp port 80))'
+   ```
+
+   Deja la captura ejecutándose. Es normal ver paquetes hacia los backends procedentes de los monitores HTTP incluso cuando no hay solicitudes del cliente.
+
+4. En la **Terminal C (Ubuntu)**, envía cinco solicitudes HTTP completas en paralelo y mantén sus sockets abiertos 30 segundos:
+
+   ```bash
+   for i in $(seq 1 5); do
+     (
+       exec 3<>/dev/tcp/10.1.3.200/8080 || exit
+       printf 'GET / HTTP/1.1\r\nHost: 10.1.3.200\r\nConnection: keep-alive\r\n\r\n' >&3
+       printf 'HTTP %02d enviado\n' "$i"
+       sleep 30
+       exec 3<&-
+       exec 3>&-
+     ) &
+   done
+   wait
+   ```
+
+   **Qué debe suceder:** BIG-IP recibe un `GET /` válido y puede escoger un miembro del pool para procesarlo. Como el cliente no lee la respuesta durante el `sleep`, **mantener abierto su socket no garantiza que la conexión hacia el backend siga visible** durante esos 30 segundos.
+
+5. Mientras el segundo bloque sigue en ejecución, consulta inmediatamente desde la **Terminal B (BIG-IP, TMSH)**:
+
+   ```text
+   show sys connection cs-server-addr 10.1.3.200 cs-server-port 8080
    show ltm pool pool_web_lab members
    ```
 
-4. Genera tráfico:
+   Si BIG-IP conserva en ese instante la asociación cliente–servidor, puede mostrar cuatro extremos similares a los siguientes (ejemplo orientativo):
 
-   ```bash
-   for i in $(seq 1 4); do curl -s http://10.10.10.100/; echo; done
+   ```text
+   10.1.3.4:49026  10.1.3.200:8080  10.1.2.200:55001  10.1.2.4:80  tcp
    ```
 
-**Criterio de éxito:** El miembro `10.20.20.12:80` aparece como `offline` o `unavailable` (rojo). Todas las solicitudes se dirigen a `10.20.20.11`. El servicio no se interrumpe.
+   **No es obligatorio ver esa línea:** si `any6.any` persiste, el backend pudo haber contestado y cerrado o desvinculado la conexión antes de la consulta. Para identificar al servidor usado, continúa con la captura.
 
-5. **Restaura el servicio:**
+6. En la **Terminal A (BIG-IP, Bash)**, detén `tcpdump` con `Ctrl+C` cuando hayan terminado las peticiones. Identifica dos conversaciones que coincidan con el momento en que ejecutaste el segundo `for`:
+
+   | Segmento | IP de origen | IP de destino | Interpretación |
+   |---|---|---|---|
+   | Cliente → VIP | `10.1.3.4:puerto_efímero` | `10.1.3.200:8080` | Ubuntu establece la conexión con BIG-IP |
+   | BIG-IP → servidor | `10.1.2.200:puerto_efímero` | `10.1.2.4:80` o `10.1.2.5:80` | BIG-IP selecciona el backend y aplica SNAT AutoMap |
+
+   En ambas conversaciones busca paquetes `Flags [S]`, `Flags [S.]` y `Flags [.]` para reconocer los handshakes TCP. La **dirección de origen `10.1.2.200`** en el segundo segmento es la evidencia de SNAT AutoMap. Los monitores pueden generar tráfico similar hacia el backend; para distinguirlo del tráfico de cliente, correlaciona el instante de los `GET` con el incremento de las conexiones/estadísticas del pool.
+
+7. Comprueba que la VIP sigue funcionando con una petición normal desde **Ubuntu**:
 
    ```bash
-   ssh usuario@10.20.20.12 "sudo systemctl start apache2"
+   curl -sS --max-time 5 -o /dev/null -w 'HTTP %{http_code}\n' http://10.1.3.200:8080/
    ```
 
-6. Espera 15 segundos y verifica que el miembro vuelve a estado Available.
+   Desde **TMSH** verifica:
 
-### Prueba 4: Caso adverso — solicitud a un puerto no configurado
-
-Desde el cliente, intenta acceder a un puerto no configurado en el Virtual Server:
-
-```bash
-curl -v --connect-timeout 5 http://10.10.10.100:8080/
-```
-
-**Criterio de éxito:** La conexión es rechazada o expira (timeout). BIG-IP no tiene un Virtual Server escuchando en `10.10.10.100:8080`, por lo que no procesa el tráfico. Esto confirma que BIG-IP solo responde en las combinaciones IP:puerto explícitamente configuradas.
-
-### Prueba 5: Caso adverso — verificación con información contradictoria
-
-Ejecuta desde el cliente:
-
-```bash
-curl -s -H "Host: servidor-inexistente.example.com" http://10.10.10.100/
-```
-
-**Criterio de éxito:** BIG-IP procesa la solicitud normalmente y la reenvía al pool (el Virtual Server no tiene políticas basadas en Host header). El servidor backend responde con su contenido estándar. Esta prueba verifica que un Virtual Server de tipo Standard sin iRules ni políticas de enrutamiento por contenido no discrimina por cabecera Host: todo el tráfico que llega a la VIP:puerto se envía al default pool.
-
-## Solución de Problemas
-
-### Problema 1: El pool member se muestra como Offline (rojo) inmediatamente después de crearlo
-
-**Síntomas:** Al verificar el pool en TMUI o con `show ltm pool pool_web_lab members`, uno o ambos miembros muestran estado `offline` con razón `No successful responses received before deadline`.
-
-**Causa:** El health monitor HTTP no recibe la cadena esperada (`200 OK`) en la respuesta del servidor. Las causas más comunes son:
-
-- El servicio Apache/NGINX no está activo en el servidor backend.
-- El servidor responde con un código diferente (por ejemplo, `301 Moved Permanently` si hay redirección configurada).
-- Un firewall del host bloquea el tráfico desde la Self IP de BIG-IP (`10.20.20.245`).
-- La cadena `recv` del monitor no coincide exactamente con la respuesta del servidor.
-
-**Resolución:**
-
-1. Verifica que el servicio web está activo en el servidor:
-
-   ```bash
-   ssh usuario@10.20.20.11 "sudo systemctl status apache2"
+   ```text
+   show ltm pool pool_web_lab members
+   show ltm virtual vs_web_lab
    ```
 
-2. Prueba la conectividad HTTP desde BIG-IP al servidor:
+**Comprobación del Paso 5:**
 
-   ```bash
-   run util curl -s -o /dev/null -w '%{http_code}' http://10.20.20.11/
+- [ ] Observé conexiones `10.1.3.4 → 10.1.3.200:8080` durante la primera prueba.
+- [ ] Puedo explicar por qué en esas conexiones puede aparecer `any6.any`.
+- [ ] Envié solicitudes `GET /` completas durante la segunda prueba.
+- [ ] En `tcpdump`, distinguí el flujo cliente–VIP y el flujo BIG-IP–backend.
+- [ ] Identifiqué `10.1.2.200` como dirección de origen traducida por SNAT AutoMap.
+- [ ] Confirmé que HTTP sigue respondiendo desde la VIP.
+
+**Pregunta de análisis:** ¿por qué en el lado External aparece como destino `10.1.3.200:8080`, mientras que en el lado Internal aparece `10.1.2.4:80` o `10.1.2.5:80`? Relaciona ambos flujos con el funcionamiento *full-proxy* de BIG-IP.
+
+---
+
+### Paso 6. Simular una retirada controlada de un miembro (12 min)
+
+**Objetivo:** comprobar continuidad del servicio ante una intervención sobre un backend, sin apagar máquinas ni necesitar sus contraseñas.
+
+1. Confirma que ambos miembros están **Enabled** y **Available**, y que `curl http://10.1.3.200:8080/` devuelve HTTP 200. Registra los contadores de conexión de ambos miembros antes de hacer el cambio.
+2. En **Local Traffic → Pools → Pool List → pool_web_lab → Members**, selecciona `10.1.2.5:80` y utiliza la acción **Disable** (deshabilitar miembro). **No selecciones Delete ni Forced Offline.**
+3. En TMSH confirma el estado administrativo:
+
+   ```text
+   show ltm pool pool_web_lab members
    ```
 
-   Si devuelve `301` en lugar de `200`, ajusta la configuración del servidor o modifica el monitor:
+4. Desde Ubuntu ejecuta:
 
    ```bash
-   modify ltm monitor http monitor_http_lab recv "HTTP/1."
+   for i in $(seq 1 8); do
+     curl -sS --max-time 5 -o /dev/null -w '%{http_code}\n' http://10.1.3.200:8080/
+   done
    ```
 
-3. Verifica que no hay reglas de firewall bloqueando en el servidor:
+5. Actualiza las estadísticas de miembros en TMUI o ejecuta nuevamente `show ltm pool pool_web_lab members`. Comprueba el **incremento** de las conexiones hacia `10.1.2.4:80` y que las nuevas peticiones no se asignan a `10.1.2.5:80`. Los monitores pueden continuar activos sobre el miembro deshabilitado.
+6. Vuelve a **Members**, selecciona `10.1.2.5:80` y aplica **Enable**. Genera otras ocho peticiones nuevas y comprueba que ambos miembros vuelven a participar. **No termines la práctica hasta comprobar que Web02 quedó habilitado.**
 
-   ```bash
-   ssh usuario@10.20.20.11 "sudo iptables -L -n | grep -i drop"
-   ```
+**Análisis:** **Disable no equivale a un fallo de salud**. El miembro puede seguir respondiendo al monitor, pero queda administrativamente fuera de la selección normal de nuevas conexiones. Las conexiones existentes y determinadas configuraciones de persistencia pueden comportarse de otra forma. Esta prueba demuestra **drenaje administrativo básico y continuidad**, no una caída real de Apache.
 
-4. Tras corregir, espera un ciclo de monitor (10 segundos) y verifica nuevamente.
+### Paso 7. Validación integral y evidencia (8 min)
 
-### Problema 2: El cliente puede hacer ping a la VIP pero curl no devuelve respuesta
+**Objetivo:** cerrar el diagnóstico con hechos y dejar el pod preparado para el siguiente laboratorio.
 
-**Síntomas:** Desde el cliente (`10.10.10.10`), `ping 10.10.10.100` es exitoso, pero `curl http://10.10.10.100/` se queda colgado o devuelve `Connection refused`.
+1. Desde BIG-IP TMSH verifica:
 
-**Causa:** El ping responde porque la dirección `10.10.10.100` está en la misma subred que la Self IP external y BIG-IP responde a ARP para esa dirección (es la VIP). Sin embargo, el Virtual Server puede no estar procesando tráfico TCP/80 correctamente. Las causas posibles son:
-
-- El Virtual Server no tiene `ip-protocol tcp` configurado (por defecto usa `all`, lo cual puede causar comportamientos inesperados).
-- Falta el perfil `tcp` en el Virtual Server.
-- El SNAT AutoMap no está configurado y los servidores no tienen ruta de retorno hacia el cliente a través de BIG-IP.
-- El pool está offline (ambos miembros fallaron).
-
-**Resolución:**
-
-1. Verifica la configuración completa del Virtual Server:
-
-   ```bash
+   ```text
    list ltm virtual vs_web_lab
+   list ltm pool pool_web_lab
+   show ltm pool pool_web_lab members
+   show ltm virtual vs_web_lab
+   list net self
    ```
 
-   Confirma que incluye `ip-protocol tcp`, `profiles { tcp http }` y `source-address-translation { type automap }`.
-
-2. Si falta SNAT AutoMap, agrégalo:
+2. Desde Ubuntu verifica la aplicación y la administración, como pruebas separadas:
 
    ```bash
-   modify ltm virtual vs_web_lab source-address-translation { type automap }
+   curl -sS --max-time 5 -o /dev/null -w 'VIP: HTTP %{http_code}\n' http://10.1.3.200:8080/
+   curl -ksS --max-time 5 -o /dev/null -w 'TMUI: HTTP %{http_code}\n' https://10.1.1.200/tmui/login.jsp
    ```
 
-3. Verifica el estado del pool:
+3. Completa tu evidencia:
 
-   ```bash
-   show ltm pool pool_web_lab
-   ```
+   | Comprobación | Evidencia observada |
+   |---|---|
+   | Monitor HTTP | Nombre y estado |
+   | Miembros activos del pool | Web01 / Web02 |
+   | VIP y puerto | `10.1.3.200:8080` |
+   | Resultado de `curl` | Código HTTP |
+   | IP origen en External | IP observada en captura |
+   | IP origen en Internal | IP observada en captura |
+   | Servicio disponible con Web02 deshabilitado | Código HTTP y contadores observados |
+   | Estado final de Web02 | Enabled y Available |
 
-   Si el pool está offline, resuelve primero el Problema 1.
+4. Explica brevemente dónde investigarías primero en cada caso: **VIP sin respuesta; un pool member Offline; servicio disponible con un miembro deshabilitado**.
 
-4. Verifica con tcpdump en la VLAN internal si el tráfico llega al servidor:
+## Validación y pruebas: criterios de éxito
 
-   ```bash
-   tcpdump -nni internal -c 20 port 80
-   ```
+| Prueba | Éxito verificable | Qué demuestra |
+|---|---|---|
+| Cliente → VIP | Respuesta HTTP desde `10.1.3.200:8080` | Publicación funcional del servicio |
+| Pool | Dos miembros disponibles al inicio y al final | Supervisión de salud |
+| Distribución | Contadores o conexiones en ambos miembros | Round Robin bajo nuevas conexiones |
+| Full-proxy | Se observan conversaciones lado cliente y lado servidor | Separación TCP de BIG-IP |
+| AutoMap | Origen de servidor corresponde a Self IP de salida | SNAT de origen |
+| Retirada controlada | VIP sigue atendiendo solicitudes con un miembro deshabilitado | Continuidad ante mantenimiento |
+| Recuperación | Web02 vuelve a Enabled y disponible | Reversión de cambio |
 
-   Si no se ven paquetes, el problema está en la configuración del Virtual Server o en la selección del pool member.
+## Solución de problemas
 
-## Limpieza
+### Problema 1. La VIP no responde, pero la Management IP sí
 
-Si deseas revertir la configuración del laboratorio a su estado inicial (solo Management IP), ejecuta los siguientes comandos en tmsh en el **orden inverso** al de creación, respetando las dependencias de objetos:
+1. Desde Ubuntu: `ip route get 10.1.3.200` (debe salir por `eth1`).
+2. Verifica que la VIP se configuró con **TCP/8080**, no TCP/443.
+3. En BIG-IP: `list ltm virtual vs_web_lab` y `show ltm virtual vs_web_lab`.
+4. Comprueba que no existe otro listener coincidente y que el pool tiene miembros disponibles.
+5. Si es necesario, captura el tráfico en BIG-IP: desde Bash `tcpdump -nni 0.0 'host 10.1.3.4 and tcp port 8080'`.
 
-```bash
-## 1. Eliminar el Virtual Server
-delete ltm virtual vs_web_lab
+**No modifiques la Management IP, las rutas de Azure ni Port Lockdown para corregir a ciegas este síntoma.**
 
-## 2. Eliminar el Pool
-delete ltm pool pool_web_lab
+### Problema 2. Pool rojo o un miembro Offline
 
-## 3. Eliminar el Monitor personalizado
-delete ltm monitor http monitor_http_lab
+1. `show ltm pool pool_web_lab members` para consultar el motivo.
+2. Verifica `list ltm monitor http monitor_http_lab` y el `Receive String` configurado.
+3. Identifica si el servidor contesta en el puerto 80 y si su respuesta contiene `200 OK`.
+4. Si ambos miembros fallan, revisa conectividad `Internal`, rutas de retorno y controles de red; evita cambiar aleatoriamente el monitor para forzarlo a verde.
 
-## 4. Eliminar los Nodos (creados automáticamente con el pool)
-delete ltm node 10.20.20.11
-delete ltm node 10.20.20.12
+### Problema 3. El VIP responde, pero no hay alternancia visible
 
-## 5. Eliminar la ruta por defecto
-delete net route default_route
+Los servidores pueden mostrar contenido idéntico. Comprueba las **estadísticas por miembro** y utiliza solicitudes HTTP independientes antes de concluir que Round Robin está fallando.
 
-## 6. Eliminar las Self IPs
-delete net self self_external
-delete net self self_internal
+### Problema 4. La captura solo muestra monitores o no hay paquetes
 
-## 7. Eliminar las VLANs
-delete net vlan external
-delete net vlan internal
+Comprueba que capturas en la interfaz de TMM (`0.0`) **mientras** generas tráfico desde Ubuntu. Reduce el filtro a `tcp port 8080` para aislar el lado cliente, y después examina `tcp port 80` hacia los backends. Los monitores generan tráfico adicional aunque ningún usuario consulte la VIP.
 
-## 8. Guardar la configuración limpia
+### Problema 5. `show sys connection` está vacío o muestra `any6.any`
+
+- **Tabla vacía:** probablemente las conexiones ya terminaron. Ejecuta el `for` de **10 sockets TCP durante 45 segundos** del Paso 5 y consulta TMSH mientras continúa en ejecución. En Ubuntu usa `ss -tn | grep '10.1.3.200:8080'` para confirmar los sockets abiertos.
+- **Aparece `any6.any`:** las conexiones hacia la VIP existen, pero no hay información visible de una conexión asociada del lado servidor en ese instante. El primer `for` no envía HTTP y ese resultado es esperable.
+- **Se envió HTTP y todavía aparece `any6.any`:** el servidor puede haber respondido y cerrado su lado de la conexión antes de la consulta. No se requiere aumentar los timeouts ni generar tráfico indefinidamente: valida las direcciones y el pool member con `tcpdump -nni 0.0` y revisa las estadísticas del pool.
+
+### Problema 6. Web02 no vuelve a recibir tráfico
+
+En **Pool Members**, comprueba que el estado administrativo sea **Enabled**, no solamente que responda a los monitores. Revisa también si existen conexiones persistentes previas y repite nuevas solicitudes.
+
+## Limpieza y estado final
+
+**Conserva los objetos creados**, porque sirven como base para las siguientes prácticas:
+
+- `monitor_http_lab`, `pool_web_lab` y `vs_web_lab`.
+- Ambos miembros (`10.1.2.4:80` y `10.1.2.5:80`) **Enabled** y disponibles.
+- Virtual Server en `10.1.3.200:8080` con SNAT AutoMap.
+- Management IP `10.1.1.200`, Self IPs `.200`, VLANs y rutas **sin cambios**.
+
+Guarda en TMSH:
+
+```text
 save sys config
 ```
 
-> **Importante:** En un entorno de curso donde los laboratorios posteriores dependen de esta configuración, **NO ejecutes la limpieza** a menos que el instructor lo indique. Los laboratorios siguientes del Módulo 2 asumen que las VLANs, Self IPs, rutas, pool y Virtual Server creados aquí permanecen configurados.
-
-**Verificación posterior a la limpieza (si se ejecutó):**
-
-```bash
-list net vlan
-list net self
-list net route
-list ltm virtual
-list ltm pool
-```
-
-Todos los comandos deben devolver resultados vacíos o solo la configuración de fábrica.
+**No elimines `vs_web_lab`, `pool_web_lab` ni `monitor_http_lab` al finalizar:** serán utilizados en prácticas posteriores. Si necesitas detener una prueba en curso, utiliza `Ctrl+C` en la terminal correspondiente; no elimines objetos de red. **Nunca elimines las VLANs, Self IPs ni rutas preexistentes.**
 
 ## Resumen
 
-En este laboratorio se construyó de forma incremental el camino de datos completo de un BIG-IP VE, partiendo de una configuración de fábrica hasta lograr un servicio HTTP balanceado y funcional. Los conceptos clave reforzados son:
+El laboratorio demuestra la diferencia entre **infraestructura de red ya existente** e **instancias de servicio creadas sobre ella**. El monitor determina salud, el pool reúne los backends, el Virtual Server presenta un destino lógico de aplicación, Round Robin reparte nuevas conexiones y SNAT AutoMap modifica la IP de origen del lado servidor. Las capturas evidencian la arquitectura full-proxy; la retirada administrativa de un miembro prueba continuidad del servicio sin interrumpir el pod.
 
-- **Interfaces** son los puntos de conexión física/virtual de BIG-IP a la red. Su estado operativo es el fundamento de toda comunicación.
-- **VLANs** segmentan el tráfico en dominios de broadcast independientes (external para clientes, internal para servidores), asociándose a interfaces específicas.
-- **Self IPs** otorgan a BIG-IP una identidad de capa 3 en cada VLAN, habilitando la comunicación IP y los servicios de gestión en banda. El port lockdown controla qué servicios son accesibles a través de cada Self IP.
-- **Rutas estáticas** definen cómo BIG-IP alcanza redes no directamente conectadas, siendo esenciales para el tráfico de retorno en topologías con múltiples subredes.
-- **Virtual Servers** son el punto de entrada lógico de las aplicaciones. Combinados con pools, health monitors y SNAT, implementan la selección inteligente de servidores.
-- **Full-proxy:** Las capturas con `tcpdump` demostraron que BIG-IP mantiene dos conexiones TCP independientes — una con el cliente y otra con el servidor — transformando las direcciones IP en cada lado. Esto es fundamental para comprender que BIG-IP no es un simple router, sino un proxy completo que puede inspeccionar, modificar y optimizar el tráfico en ambas direcciones.
+## Recursos adicionales
 
-### Relación con alta disponibilidad
-
-En esta topología de laboratorio con un único BIG-IP VE, cada componente del camino de datos (interfaz, VLAN, Self IP, ruta, pool member, Virtual Server) representa un posible punto único de fallo. En un entorno de producción, una arquitectura Active/Standby con Device Service Clustering (DSC) mitigaría el fallo del propio BIG-IP, mientras que múltiples pool members mitigan el fallo de servidores individuales. La reflexión del Paso 7 conecta directamente con los conceptos de alta disponibilidad del tema 2.5.
-
-### Recursos adicionales
-
-| Recurso | URL |
-|---|---|
-| F5 BIG-IP LTM: Conceptos básicos de tráfico local | [https://techdocs.f5.com/en-us/bigip-17-1-0/big-ip-local-traffic-management.html](https://techdocs.f5.com/en-us/bigip-17-1-0/big-ip-local-traffic-management.html) |
-| F5 BIG-IP: Configuración de VLANs y Self IPs | [https://techdocs.f5.com/en-us/bigip-17-1-0/big-ip-tmos-routing-administration.html](https://techdocs.f5.com/en-us/bigip-17-1-0/big-ip-tmos-routing-administration.html) |
-| F5 BIG-IP: Referencia de tmsh | [https://clouddocs.f5.com/cli/tmsh-reference/latest/](https://clouddocs.f5.com/cli/tmsh-reference/latest/) |
-| F5 Glossary: Full Proxy | [https://www.f5.com/glossary/full-proxy](https://www.f5.com/glossary/full-proxy) |
-| F5 BIG-IP: Uso de tcpdump en TMOS | [https://my.f5.com/manage/s/article/K13637](https://my.f5.com/manage/s/article/K13637) |
+- [F5 BIG-IP Local Traffic Management — documentación técnica](https://techdocs.f5.com/)
+- [Referencia TMSH de F5](https://clouddocs.f5.com/cli/tmsh-reference/latest/)
+- [F5: arquitectura full-proxy](https://www.f5.com/glossary/full-proxy)
+- [F5 Support — artículos y documentación](https://my.f5.com/)
